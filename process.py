@@ -1,99 +1,163 @@
-"""The only file you need to change.
-
-This one is the notebook's example feature, run over many recordings instead
-of one: load a resting-state recording with the dataset's own loader, take the
-Welch power spectrum of every electrode, and integrate 8-12 Hz to get absolute
-alpha power in uV^2. Explore in starting_notebooks/bdf_exploration.ipynb, then
-change this file -- it is the same computation, so the numbers agree.
-
-It is a starting point, not a suggestion about what to study.
-"""
-
-import sys
+import json
+import random
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import torch
+from torch.utils.data import DataLoader
 
-#: The loader that comes with the notebook travels with your job, because
-#: `habs submit` uploads this repository. It reads the .record_map beside a
-#: recording, so it knows which of the 84 channels are electrodes and which
-#: are ECG, respiration, skin conductance or gaze -- and it puts the 166 Hz
-#: gaze samples on the same timeline as the 1 kHz signals.
-sys.path.insert(0, str(Path(__file__).resolve().parent / "starting_notebooks"))
-from bdf_loader import load_bdf  # noqa: E402
-
-#: BDF headers do not agree on a unit. MNE wants volts.
-TO_VOLTS = {"V": 1.0, "mV": 1e-3, "uV": 1e-6, "µV": 1e-6, "μV": 1e-6, "nV": 1e-9}
-
-BAND = (8.0, 12.0)          # alpha
-RECORDINGS = 3              # raise it once you know how long yours take
-
-
-def alpha_power(bdf: Path) -> pd.DataFrame:
-    """Absolute alpha power per electrode, in uV^2. Notebook section 6."""
-    import mne
-    from scipy.integrate import trapezoid
-
-    raw, signals, channels = load_bdf(bdf)
-    electrodes = channels.loc[channels.mne_type == "eeg", "bdf_label"].tolist()
-    units = channels.set_index("bdf_label")["header_unit"].to_dict()
-    rate = float(raw.info["sfreq"])
-
-    volts = np.vstack([signals[ch].to_numpy() * TO_VOLTS[units[ch]] for ch in electrodes])
-    eeg = mne.io.RawArray(volts, mne.create_info(electrodes, rate, "eeg"), verbose="ERROR")
-
-    # A two-second window: long enough to resolve the alpha peak, short enough
-    # that Welch averages over many of them.
-    window = min(round(2 * rate), eeg.n_times)
-    spectrum = eeg.compute_psd(method="welch", fmin=0.5, fmax=min(48.0, rate / 2),
-                               n_fft=window, n_per_seg=window, n_overlap=window // 2,
-                               verbose=False)
-    psd, freqs = spectrum.get_data(return_freqs=True)
-    psd = psd * 1e12                                   # V^2/Hz -> uV^2/Hz
-    band = (freqs >= BAND[0]) & (freqs <= BAND[1])
-
-    return pd.DataFrame({
-        "channel": electrodes,
-        "alpha_uV2": trapezoid(psd[:, band], x=freqs[band], axis=1),
-        "seconds": eeg.n_times / rate,
-    })
+from disentanglement.config import PreprocessingConfig, TrainingConfig
+from disentanglement.data_loading import build_trial_index
+from disentanglement.dataset import EmotionWindowDataset
+from disentanglement.models import MultimodalDisentanglement
+from disentanglement.normalization import fit_normalization
+from disentanglement.splits import save_split, subject_video_split
+from disentanglement.train import evaluate, save_checkpoint, seed_everything, train_epoch
 
 
 def process(data_dir: Path, out_dir: Path) -> None:
-    """Read recordings from data_dir, write your results into out_dir.
+    """Run bounded emotion training and write all experiment artifacts."""
+    data_dir = Path(data_dir)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    data_dir is the dataset root, read-only and identical for every team:
-    data_dir/CURATED/P001/..., and on the platform also labels.csv,
-    participants.csv and scripts/. Anything you write into out_dir is kept.
+    preprocessing = PreprocessingConfig()
+    training = TrainingConfig()
+    seed_everything(training.seed)
 
-    The same code runs against sample/, which has the same layout.
-    """
-    # Named rather than globbed over everything. The dataset is 385 GB: the
-    # emotion-video recordings are 150-280 MB each, resting-state about 20.
-    recordings = sorted(data_dir.glob("CURATED/P*/P*_task-resting-state_*.bdf"))
-    print(f"{len(recordings)} resting-state recording(s) found; "
-          f"using up to {RECORDINGS}")
+    labels = data_dir / "labels_train.csv"
+    if not labels.is_file():
+        labels = data_dir.parent / "labels_train.csv"
+    if not labels.is_file():
+        labels = data_dir.parent / "data" / "labels_train.csv"
 
-    per_channel, summary = [], []
-    for bdf in recordings[:RECORDINGS]:
-        table = alpha_power(bdf)
-        table.insert(0, "recording", bdf.stem)
-        per_channel.append(table)
+    trial_index = build_trial_index(data_dir, labels)
+    trial_index.to_csv(out_dir / "trial_index.csv", index=False)
+    trial_index = trial_index[
+        trial_index["final_emotion_label"].str.upper() != "TESTSUBJECT"
+    ].copy()
 
-        strongest = table.loc[table.alpha_uV2.idxmax()]
-        summary.append({
-            "recording": bdf.stem,
-            "participant": bdf.parent.name,
-            "seconds": round(float(table.seconds.iloc[0]), 1),
-            "electrodes": len(table),
-            "alpha_uV2_mean": float(table.alpha_uV2.mean()),
-            "strongest_channel": strongest.channel,
-            "strongest_uV2": float(strongest.alpha_uV2),
-        })
-        print(f"  {bdf.stem}: {summary[-1]['alpha_uV2_mean']:.1f} uV^2 mean, "
-              f"strongest {strongest.channel} at {strongest.alpha_uV2:.1f}")
+    emotions = sorted(trial_index["final_emotion_label"].dropna().unique().tolist())
+    label_to_id = {emotion: index for index, emotion in enumerate(emotions)}
 
-    pd.DataFrame(summary).to_csv(out_dir / "alpha.tsv", sep="\t", index=False)
-    pd.concat(per_channel).to_csv(out_dir / "alpha_by_channel.tsv", sep="\t", index=False)
-    print(f"\nwrote alpha.tsv ({len(summary)} recordings) and alpha_by_channel.tsv")
+    split = subject_video_split(trial_index, seed=training.seed)
+    save_split(split, out_dir / "split.json")
+
+    train_subjects = set(split["train_subjects"])
+    train_videos = set(split["train_videos"])
+    subject_rng = random.Random(training.seed)
+    video_rng = random.Random(training.seed + 1)
+    subjects = sorted(train_subjects)
+    videos = sorted(train_videos)
+    subject_rng.shuffle(subjects)
+    video_rng.shuffle(videos)
+    subject_validation_count = max(1, round(len(subjects) * 0.2))
+    video_validation_count = max(1, round(len(videos) * 0.2))
+    validation_subjects = set(subjects[:subject_validation_count])
+    validation_videos = set(videos[:video_validation_count])
+    training_subjects = train_subjects - validation_subjects
+    training_videos = train_videos - validation_videos
+    private_subjects = train_subjects
+
+    subject_to_id = {
+        subject: index
+        for index, subject in enumerate(sorted(private_subjects))
+    }
+    normalization = fit_normalization(
+        trial_index,
+        training_subjects,
+        training_videos,
+        max_trials=64,
+    )
+
+    np.savez(
+        out_dir / "normalization.npz",
+        **{
+            f"{name}_{kind}": value
+            for name, (mean, std) in normalization.items()
+            for kind, value in (("mean", mean), ("std", std))
+        },
+    )
+
+    train_dataset = EmotionWindowDataset(
+        trial_index,
+        training_subjects,
+        training_videos,
+        label_to_id,
+        subject_to_id,
+        normalization,
+        max_trials=training.max_trials_per_epoch,
+    )
+    validation_dataset = EmotionWindowDataset(
+        trial_index,
+        validation_subjects,
+        validation_videos,
+        label_to_id,
+        subject_to_id,
+        normalization,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=training.batch_size,
+        shuffle=True,
+        num_workers=training.num_workers,
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=training.batch_size,
+        shuffle=False,
+        num_workers=training.num_workers,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    eeg_channels = 62
+    model = MultimodalDisentanglement(
+        num_classes=len(label_to_id),
+        eeg_channels=eeg_channels,
+        training_subjects=sorted(private_subjects),
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=training.learning_rate)
+    weights = {
+        "alpha": training.alpha,
+        "beta": training.beta,
+        "gamma": training.gamma,
+        "delta": training.delta,
+        "epsilon": training.epsilon,
+    }
+
+    history = []
+    best_accuracy = -1.0
+    for epoch in range(training.epochs):
+        train_metrics = train_epoch(model, train_loader, optimizer, device, weights)
+        validation_metrics = evaluate(model, validation_loader, device)
+        row = {
+            "epoch": epoch + 1,
+            "device": str(device),
+            **{f"train_{key}": value for key, value in train_metrics.items()},
+            **{f"validation_{key}": value for key, value in validation_metrics.items()},
+        }
+        history.append(row)
+
+        if validation_metrics["accuracy"] > best_accuracy:
+            best_accuracy = validation_metrics["accuracy"]
+            save_checkpoint(model, optimizer, epoch + 1, out_dir / "best_model.pt")
+        save_checkpoint(model, optimizer, epoch + 1, out_dir / "final_model.pt")
+        print(f"epoch {epoch + 1}: {row}")
+
+    (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    (out_dir / "labels.json").write_text(
+        json.dumps(label_to_id, indent=2), encoding="utf-8"
+    )
+    (out_dir / "training_config.json").write_text(
+        json.dumps(training.__dict__, indent=2), encoding="utf-8"
+    )
+    (out_dir / "preprocessing_config.json").write_text(
+        json.dumps(preprocessing.__dict__, indent=2), encoding="utf-8"
+    )
+
+    print(
+        f"{len(trial_index)} valid trials; "
+        f"{len(train_dataset)} train windows; "
+        f"{len(validation_dataset)} validation windows"
+    )
