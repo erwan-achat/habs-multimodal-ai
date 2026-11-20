@@ -37,7 +37,12 @@ def train_epoch(model, loader: DataLoader, optimizer, device, weights: dict[str,
 
 
 @torch.no_grad()
-def evaluate(model, loader: DataLoader, device) -> dict[str, float]:
+def evaluate(
+    model,
+    loader: DataLoader,
+    device,
+    use_subject_ids: bool = True,
+) -> dict[str, float]:
     model.eval()
     correct = 0
     total = 0
@@ -45,14 +50,14 @@ def evaluate(model, loader: DataLoader, device) -> dict[str, float]:
     for batch in loader:
         inputs = {name: batch[name].to(device) for name in ("eeg", "gsr", "respiration")}
         targets = batch["label"].to(device)
-        subjects = batch["subject"].to(device)
+        subjects = batch["subject"].to(device) if use_subject_ids else None
         logits = model(inputs, subjects)
         loss_values.append(F.cross_entropy(logits, targets).item())
         correct += (logits.argmax(dim=-1) == targets).sum().item()
         total += targets.numel()
     return {
         "accuracy": correct / max(total, 1),
-        "loss": float(np.mean(loss_values)),
+        "loss": float(np.mean(loss_values)) if loss_values else 0.0,
     }
 
 

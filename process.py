@@ -1,5 +1,4 @@
 import json
-import random
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +10,8 @@ from disentanglement.data_loading import build_trial_index
 from disentanglement.dataset import EmotionWindowDataset
 from disentanglement.models import MultimodalDisentanglement
 from disentanglement.normalization import fit_normalization
-from disentanglement.splits import save_split, subject_video_split
+from disentanglement.splits import build_partitions, save_split
+from disentanglement.dataset import RecordingGroupedSampler
 from disentanglement.train import evaluate, save_checkpoint, seed_everything, train_epoch
 
 
@@ -40,31 +40,44 @@ def process(data_dir: Path, out_dir: Path) -> None:
     emotions = sorted(trial_index["final_emotion_label"].dropna().unique().tolist())
     label_to_id = {emotion: index for index, emotion in enumerate(emotions)}
 
-    split = subject_video_split(trial_index, seed=training.seed)
-    save_split(split, out_dir / "split.json")
+    partitions = build_partitions(trial_index, train_fraction=0.8, seed=training.seed)
+    save_split(
+        {
+            "train_subjects": set(partitions["train_subjects"]),
+            "test_subjects": set(partitions["test_subjects"]),
+            "train_videos": set(partitions["train_videos"]),
+            "test_videos": set(partitions["test_videos"]),
+        },
+        out_dir / "split.json",
+    )
 
-    train_subjects = set(split["train_subjects"])
-    train_videos = set(split["train_videos"])
-    subject_rng = random.Random(training.seed)
-    video_rng = random.Random(training.seed + 1)
-    subjects = sorted(train_subjects)
-    videos = sorted(train_videos)
-    subject_rng.shuffle(subjects)
-    video_rng.shuffle(videos)
-    subject_validation_count = max(1, round(len(subjects) * 0.2))
-    video_validation_count = max(1, round(len(videos) * 0.2))
-    validation_subjects = set(subjects[:subject_validation_count])
-    validation_videos = set(videos[:video_validation_count])
-    training_subjects = train_subjects - validation_subjects
-    training_videos = train_videos - validation_videos
-    private_subjects = train_subjects
+    training_subjects = set(partitions["train_subjects"])
+    training_videos = set(partitions["train_videos"])
+    private_subjects = training_subjects
+    validation_index = partitions["validation"]
 
     subject_to_id = {
         subject: index
         for index, subject in enumerate(sorted(private_subjects))
     }
+
+    train_index = partitions["train"].copy()
+    validation_pairs = set(
+        zip(validation_index["participant_id"], validation_index["video"], strict=True)
+    )
+    train_index = train_index[
+        [
+            (participant, video) not in validation_pairs
+            for participant, video in zip(
+                train_index["participant_id"],
+                train_index["video"],
+                strict=True,
+            )
+        ]
+    ].copy()
+
     normalization = fit_normalization(
-        trial_index,
+        train_index,
         training_subjects,
         training_videos,
         max_trials=64,
@@ -80,27 +93,31 @@ def process(data_dir: Path, out_dir: Path) -> None:
     )
 
     train_dataset = EmotionWindowDataset(
-        trial_index,
+        train_index,
         training_subjects,
         training_videos,
         label_to_id,
         subject_to_id,
         normalization,
-        max_trials=training.max_trials_per_epoch,
+        max_trials=0,
     )
     validation_dataset = EmotionWindowDataset(
-        trial_index,
-        validation_subjects,
-        validation_videos,
+        validation_index,
+        set(validation_index["participant_id"].unique()),
+        set(validation_index["video"].unique()),
         label_to_id,
         subject_to_id,
         normalization,
     )
 
+    train_sampler = RecordingGroupedSampler(
+        train_dataset.items,
+        seed=training.seed,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=training.batch_size,
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=training.num_workers,
     )
     validation_loader = DataLoader(
@@ -144,6 +161,40 @@ def process(data_dir: Path, out_dir: Path) -> None:
             save_checkpoint(model, optimizer, epoch + 1, out_dir / "best_model.pt")
         save_checkpoint(model, optimizer, epoch + 1, out_dir / "final_model.pt")
         print(f"epoch {epoch + 1}: {row}")
+
+    evaluation_metrics = {}
+    for partition_name in ("A", "B", "C"):
+        partition_index = partitions[partition_name]
+        partition_subjects = set(partition_index["participant_id"].unique())
+        partition_videos = set(partition_index["video"].unique())
+        partition_dataset = EmotionWindowDataset(
+            partition_index,
+            partition_subjects,
+            partition_videos,
+            label_to_id,
+            subject_to_id,
+            normalization,
+        )
+        partition_loader = DataLoader(
+            partition_dataset,
+            batch_size=training.batch_size,
+            shuffle=False,
+            num_workers=training.num_workers,
+        )
+        evaluation_metrics[partition_name] = evaluate(
+            model,
+            partition_loader,
+            device,
+            use_subject_ids=partition_name == "B",
+        )
+        partition_index.to_csv(
+            out_dir / f"partition_{partition_name}.csv",
+            index=False,
+        )
+    (out_dir / "evaluation.json").write_text(
+        json.dumps(evaluation_metrics, indent=2),
+        encoding="utf-8",
+    )
 
     (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     (out_dir / "labels.json").write_text(

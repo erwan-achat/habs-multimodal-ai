@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+from torch.utils.data import Sampler
 
 from disentanglement.preprocessing import load_preprocessed_segment, window_offsets
 
@@ -48,7 +49,7 @@ class EmotionWindowDataset(Dataset):
                     "label": label_to_id[emotion],
                     "subject": subject_to_id.get(str(trial.participant_id), 0),
                 })
-        self.cache: OrderedDict[Path, dict[str, np.ndarray]] = OrderedDict()
+        self.cache: OrderedDict[tuple[Path, float, float], dict[str, np.ndarray]] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self.items)
@@ -56,15 +57,17 @@ class EmotionWindowDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | int]:
         item = self.items[index]
         bdf_path = item["bdf_path"]
-        segment = self.cache.get(bdf_path)
+        trial_start = float(item["trial_start_s"])
+        cache_key = (bdf_path, trial_start, 10.0)
+        segment = self.cache.get(cache_key)
         if segment is None:
             segment = load_preprocessed_segment(
                 bdf_path,
-                start_s=float(item["trial_start_s"]),
+                start_s=trial_start,
                 duration_s=10.0,
             )
-            self.cache[bdf_path] = segment
-            if len(self.cache) > 2:
+            self.cache[cache_key] = segment
+            if len(self.cache) > 3:
                 self.cache.popitem(last=False)
 
         start = item["window_start_s"]
@@ -89,3 +92,33 @@ class EmotionWindowDataset(Dataset):
             "label": torch.tensor(item["label"], dtype=torch.long),
             "subject": torch.tensor(item["subject"], dtype=torch.long),
         }
+
+
+class RecordingGroupedSampler(Sampler[int]):
+    """Shuffle trials grouped by recording so each BDF stays opened briefly."""
+
+    def __init__(self, items: list[dict], seed: int = 42):
+        import random
+
+        self.items = items
+        self.seed = seed
+        groups: dict[tuple[str, float], list[int]] = OrderedDict()
+        for index, item in enumerate(items):
+            key = (str(item["bdf_path"]), float(item["trial_start_s"]))
+            groups.setdefault(key, []).append(index)
+        self.groups = list(groups.values())
+
+    def __iter__(self):
+        import random
+
+        rng = random.Random(self.seed)
+        groups = [list(group) for group in self.groups]
+        rng.shuffle(groups)
+        order = []
+        for group in groups:
+            rng.shuffle(group)
+            order.extend(group)
+        return iter(order)
+
+    def __len__(self) -> int:
+        return len(self.items)

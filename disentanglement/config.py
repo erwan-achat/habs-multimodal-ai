@@ -18,7 +18,7 @@ class TrainingConfig:
     learning_rate: float = 1e-3
     seed: int = 42
     num_workers: int = 0
-    max_trials_per_epoch: int = 512
+    max_trials_per_epoch: int = 0
     alpha: float = 0.002
     beta: float = 0.1
     gamma: float = 0.04

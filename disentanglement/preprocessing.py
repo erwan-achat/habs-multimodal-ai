@@ -73,6 +73,13 @@ def load_preprocessed_segment(
     source_sfreq = float(raw.info["sfreq"])
     start = max(0, round(start_s * source_sfreq))
     stop = min(raw.n_times, round((start_s + duration_s) * source_sfreq))
+    if start_s < 0 or stop <= start:
+        raise ValueError(f"Invalid segment bounds: start={start_s}, duration={duration_s}")
+    if stop != round((start_s + duration_s) * source_sfreq):
+        raise ValueError(
+            f"Segment extends beyond {bdf_path.name}: "
+            f"{start_s + duration_s:.3f}s > {raw.n_times / source_sfreq:.3f}s"
+        )
 
     eeg = raw.get_data(picks=eeg_names, start=start, stop=stop)
     gsr = raw.get_data(picks=[gsr_name], start=start, stop=stop)[0]
