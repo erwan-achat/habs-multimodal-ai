@@ -1,4 +1,4 @@
-# AGENTS.md
+﻿# AGENTS.md
 
 ## 1. Development guidelines
 
@@ -14,8 +14,9 @@
 Implement a multimodal physiological signal disentanglement framework inspired by **MDNet (IJCAI 2024)** for emotion recognition.
 Framework paper is available at `/docs/modality_and_subject_disentanglement.pdf`.
 
-Our implementation will use three modalities:
-- EEG: 64 electrodes.
+Our implementation will use four modalities:
+- EEG: 62 electrodes.
+- ECG: Electrocardiography.
 - GSR: Galvanic Skin Response.
 - Respiration.
 
@@ -35,9 +36,13 @@ The main objectives are:
   to memory limits. Never load the full 300+ GB dataset into memory.
 - Exclude gaze data completely; it must not enter preprocessing, training or inference.
 - Each 10-second video-viewing segment maps to one `final_emotion` target among 12 emotions, including neutral.
-- Exclude recording trials with `flagged_outlier=1` in `labels_train.csv`.
+- Read trial annotations from `labels_train.csv`.
+- Exclude recording trials flagged with `1` or the released `TESTSUBJECT` sentinel in `labels_train.csv`.
 - Reconstruct segment boundaries from recording metadata and event/marker
   annotations; do not assume that trial order alone gives exact boundaries.
+- Prefer exact BDF annotation boundaries: start marker `marker_id` and end marker
+  `marker_id + 1`; use the following `*13` marker or metadata duration only as
+  fallback. Never extend an interval past the physical BDF duration.
 
 ## 4. Temporal segmentation
 
@@ -58,18 +63,26 @@ All encoders must output a feature vector of the same dimension:
 
 `d = 128` (initial configuration).
 
-### 4.1 EEG encoder
+### 5.1 EEG encoder
 
 Use a 2D CNN to extract features from the EEG matrix:
 
-- Input: `[64 electrodes, T time samples]`.
+- Input: `[62 electrodes, T time samples]`.
 - Apply convolutions across both the electrode and temporal dimensions.
 - Use temporal and spatial feature extraction.
 - Apply pooling and a projection layer to obtain a 128-dimensional representation.
 
 **Important:** Electrode ordering does not necessarily represent physical proximity. The initial CNN may exploit local channel-index relationships, but must not assume that these correspond to anatomical relationships. Explicit spatial geometry (10-10 electrode positions) is a potential future improvement.
 
-### 4.2 GSR encoder
+### 5.2 ECG encoder
+
+Use an independent 1D CNN.
+
+- Input: ECG time series.
+- Extract local temporal patterns.
+- Apply pooling and projection to obtain a 128-dimensional representation.
+
+### 5.3 GSR encoder
 
 Use an independent 1D CNN.
 
@@ -77,7 +90,7 @@ Use an independent 1D CNN.
 - Extract local temporal patterns.
 - Apply pooling and projection to obtain a 128-dimensional representation.
 
-### 4.3 Respiration encoder
+### 5.4 Respiration encoder
 
 Use an independent 1D CNN.
 
@@ -85,13 +98,14 @@ Use an independent 1D CNN.
 - Extract local temporal patterns.
 - Apply pooling and projection to obtain a 128-dimensional representation.
 
-### 4.4 Encoder outputs
+### 5.5 Encoder outputs
 
-The three encoders produce:
+The four encoders produce:
 
-- `u_eeg ∈ R^128`
-- `u_gsr ∈ R^128`
-- `u_resp ∈ R^128`
+- `u_eeg âˆˆ R^128`
+- `u_ecg âˆˆ R^128`
+- `u_gsr âˆˆ R^128`
+- `u_resp âˆˆ R^128`
 
 The encoders must remain independent. Their outputs are subsequently processed by the modality-level disentanglement module.
 
@@ -102,12 +116,12 @@ Separate each modality representation into two complementary components:
 - **Modality-invariant:** information shared across modalities.
 - **Modality-specific:** information particular to each modality.
 
-### 5.1 Encoders
+### 6.1 Encoders
 
 Implement:
 
 - One shared modality-invariant encoder, with shared parameters across all modalities.
-- Three independent modality-specific encoders, one per modality.
+- Four independent modality-specific encoders, one per modality.
 
 For each modality `i`:
 
@@ -116,7 +130,7 @@ For each modality `i`:
 
 Both representations must have dimension `d = 128`.
 
-### 5.2 Losses
+### 6.2 Losses
 
 Implement the following constraints:
 
@@ -142,9 +156,9 @@ Minimize reconstruction error using MSE.
 
 Concatenate the invariant and specific representations of all modalities.
 
-For three modalities, this produces six feature tokens:
+For four modalities, this produces eight feature tokens:
 
-`[u_inv_eeg, u_spec_eeg, u_inv_gsr, u_spec_gsr, u_inv_resp, u_spec_resp]`
+`[u_inv_eeg, u_spec_eeg, u_inv_ecg, u_spec_ecg, u_inv_gsr, u_spec_gsr, u_inv_resp, u_spec_resp]`
 
 Apply Multi-Head Self-Attention to model interactions between these representations.
 
@@ -192,17 +206,17 @@ Use cross-entropy for classification.
 
 The total training objective is:
 
-`L = L_task + α L_m_sim + β L_m_diff + γ L_m_recon + δ L_s_diff + ε L_s_recon`
+`L = L_task + Î± L_m_sim + Î² L_m_diff + Î³ L_m_recon + Î´ L_s_diff + Îµ L_s_recon`
 
 All loss weights must be configurable.
 
 Initial reference weights from the MDNet paper:
 
-- α = 0.002
-- β = 0.1
-- γ = 0.04
-- δ = 0.5
-- ε = 0.05
+- Î± = 0.002
+- Î² = 0.1
+- Î³ = 0.04
+- Î´ = 0.5
+- Îµ = 0.05
 
 These values are just a starting point.
 
@@ -210,11 +224,11 @@ These values are just a starting point.
 
 Evaluate three distinct generalization capabilities using a subject-video split:
 
-- **A — Subject generalization:** unseen subjects, known videos (`S_test × V_train`).
-- **B — Video generalization:** known subjects, unseen videos (`S_train × V_test`).
-- **C — Joint generalization:** unseen subjects, unseen videos (`S_test × V_test`).
+- **A â€” Subject generalization:** unseen subjects, known videos (`S_test Ã— V_train`).
+- **B â€” Video generalization:** known subjects, unseen videos (`S_train Ã— V_test`).
+- **C â€” Joint generalization:** unseen subjects, unseen videos (`S_test Ã— V_test`).
 
-Training must exclusively use `S_train × V_train`.
+Training must exclusively use `S_train Ã— V_train`.
 
 Requirements:
 - As an initial configuration, split subjects and videos independently with an
@@ -222,6 +236,8 @@ Requirements:
   80% training partition.
 - Create splits from participant and video identifiers before indexing windows;
   do not use random window-level splits or shuffle windows across partitions.
+- Treat each `video` identifier as an atomic unit; do not split by emotion
+  category or by a normalized video name.
 - Keep all windows and repeated recordings from a subject-video pair within the same partition.
 - Reserve validation data exclusively from the training partitions for hyperparameter selection.
 - Never use evaluation partitions A, B or C for model selection.
@@ -238,6 +254,7 @@ Initial target sampling frequencies (`sfreq`):
 | Modality | Target sfreq |
 |---|---:|
 | EEG | 256 Hz |
+| ECG | 256 Hz |
 | GSR | 32 Hz |
 | Respiration | 32 Hz |
 
@@ -254,6 +271,7 @@ Apply normalization independently to each modality.
 Initial normalization strategy: channel-wise z-score standardization.
 
 - **EEG:** Compute a separate mean and standard deviation for each electrode.
+- **ECG:** Compute one mean and standard deviation.
 - **GSR:** Compute one mean and standard deviation.
 - **Respiration:** Compute one mean and standard deviation.
 
@@ -286,11 +304,13 @@ Record training and validation classification losses separately. Disentanglement
 
 ### 12.2 Validation
 
-- Evaluate validation partitions A, B and C after each epoch.
-- Report classification metrics separately for each partition.
+- Evaluate the validation partition after each epoch. It is drawn exclusively
+  from `S_train Ã— V_train`.
+- Do not build a nested validation A/B/C split; A/B/C are final evaluation
+  partitions only and are evaluated once after training.
 - Track at least accuracy, balanced accuracy, macro-precision, macro-recall and macro-F1.
 - Use a configurable primary validation metric to select the best checkpoint.
-- Initially, use validation C macro-F1 as the primary selection criterion.
+- Initially, use validation macro-F1 as the primary selection criterion.
 - Never use final test partitions for checkpoint selection or early stopping.
 
 ### 12.3 Early stopping and checkpoints
@@ -309,8 +329,9 @@ Save all experiment artifacts inside a dedicated, configurable `out_dir`.
 At minimum, save:
 - Training and validation loss history.
 - Individual loss-component histories.
-- Validation metrics for A, B and C at each epoch.
+- Validation metrics at each epoch, and final A/B/C metrics.
 - Loss curves and validation metric curves.
+- Validation subject/video pairs.
 - Best model checkpoint.
 - Experiment configuration and hyperparameters.
 - Normalization statistics.

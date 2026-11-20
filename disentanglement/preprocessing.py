@@ -1,9 +1,13 @@
+from functools import lru_cache
 from pathlib import Path
 import json
+from math import gcd
 
 import mne
 import numpy as np
 from scipy.signal import resample_poly
+
+from disentanglement.config import PreprocessingConfig
 
 
 def window_offsets(
@@ -11,14 +15,15 @@ def window_offsets(
     window_s: float = 3.0,
     stride_s: float = 2.0,
 ) -> list[tuple[float, float]]:
-    """Return non-overlapping-start windows inside a segment."""
     starts = np.arange(0.0, duration_s - window_s + 1e-9, stride_s)
     return [(float(start), float(start + window_s)) for start in starts]
 
 
-def _channel_names(record_map: Path) -> tuple[list[str], str, str]:
+@lru_cache(maxsize=256)
+def channel_names(record_map: Path) -> tuple[tuple[str, ...], str, str, str]:
     data = json.loads(record_map.read_text(encoding="utf-8"))
     eeg_names: list[str] = []
+    ecg_name = ""
     gsr_name = ""
     respiration_name = ""
 
@@ -37,6 +42,8 @@ def _channel_names(record_map: Path) -> tuple[list[str], str, str]:
             names = [str(detail["name"]) for detail in details]
             if kind == "eeg":
                 eeg_names.extend(names[: len(indices)])
+            elif kind == "ecg" and names:
+                ecg_name = names[0]
             elif kind == "gsr" and names:
                 gsr_name = names[0]
             elif kind in {"resp", "respiration"} and names:
@@ -44,15 +51,14 @@ def _channel_names(record_map: Path) -> tuple[list[str], str, str]:
 
     if not eeg_names:
         raise ValueError("No EEG channels found in the record map")
-    if not gsr_name or not respiration_name:
-        raise ValueError("GSR or respiration channel metadata is missing")
-    return eeg_names, gsr_name, respiration_name
+    if not all((ecg_name, gsr_name, respiration_name)):
+        raise ValueError("ECG, GSR or respiration channel metadata is missing")
+    return tuple(eeg_names), ecg_name, gsr_name, respiration_name
 
 
 def resample_signal(values: np.ndarray, source_sfreq: float, target_sfreq: float) -> np.ndarray:
     if np.isclose(source_sfreq, target_sfreq):
         return np.asarray(values, dtype=np.float32)
-    from math import gcd
 
     divisor = gcd(round(source_sfreq), round(target_sfreq))
     up = round(target_sfreq) // divisor
@@ -63,29 +69,41 @@ def resample_signal(values: np.ndarray, source_sfreq: float, target_sfreq: float
 def load_preprocessed_segment(
     bdf_path: Path,
     start_s: float,
-    duration_s: float = 10.0,
+    duration_s: float | None = None,
+    config: PreprocessingConfig | None = None,
 ) -> dict[str, np.ndarray]:
-    """Load only the requested segment and return EEG/GSR/respiration arrays."""
+    config = config or PreprocessingConfig()
+    duration_s = config.trial_duration_s if duration_s is None else duration_s
     record_map = bdf_path.with_suffix(".record_map")
-    eeg_names, gsr_name, respiration_name = _channel_names(record_map)
+    eeg_names, ecg_name, gsr_name, respiration_name = channel_names(record_map)
 
     raw = mne.io.read_raw_bdf(bdf_path, preload=False, verbose="ERROR")
-    source_sfreq = float(raw.info["sfreq"])
-    start = max(0, round(start_s * source_sfreq))
-    stop = min(raw.n_times, round((start_s + duration_s) * source_sfreq))
-    if start_s < 0 or stop <= start:
-        raise ValueError(f"Invalid segment bounds: start={start_s}, duration={duration_s}")
-    if stop != round((start_s + duration_s) * source_sfreq):
-        raise ValueError(
-            f"Segment extends beyond {bdf_path.name}: "
-            f"{start_s + duration_s:.3f}s > {raw.n_times / source_sfreq:.3f}s"
-        )
+    try:
+        source_sfreq = float(raw.info["sfreq"])
+        start = max(0, round(start_s * source_sfreq))
+        stop = min(raw.n_times, round((start_s + duration_s) * source_sfreq))
+        if start_s < 0 or stop <= start:
+            raise ValueError(f"Invalid segment bounds: start={start_s}, duration={duration_s}")
+        if stop != round((start_s + duration_s) * source_sfreq):
+            raise ValueError(
+                f"Segment extends beyond {bdf_path.name}: "
+                f"{start_s + duration_s:.3f}s > {raw.n_times / source_sfreq:.3f}s"
+            )
 
-    eeg = raw.get_data(picks=eeg_names, start=start, stop=stop)
-    gsr = raw.get_data(picks=[gsr_name], start=start, stop=stop)[0]
-    respiration = raw.get_data(picks=[respiration_name], start=start, stop=stop)[0]
+        eeg = raw.get_data(picks=list(eeg_names), start=start, stop=stop)
+        ecg = raw.get_data(picks=[ecg_name], start=start, stop=stop)[0]
+        gsr = raw.get_data(picks=[gsr_name], start=start, stop=stop)[0]
+        respiration = raw.get_data(picks=[respiration_name], start=start, stop=stop)[0]
+    finally:
+        raw.close()
 
-    eeg = resample_signal(eeg, source_sfreq, 256.0)
-    gsr = resample_signal(gsr, source_sfreq, 32.0)
-    respiration = resample_signal(respiration, source_sfreq, 32.0)
-    return {"eeg": eeg, "gsr": gsr[np.newaxis, :], "respiration": respiration[np.newaxis, :]}
+    eeg = resample_signal(eeg, source_sfreq, config.eeg_sfreq)
+    ecg = resample_signal(ecg, source_sfreq, config.ecg_sfreq)
+    gsr = resample_signal(gsr, source_sfreq, config.gsr_sfreq)
+    respiration = resample_signal(respiration, source_sfreq, config.respiration_sfreq)
+    return {
+        "eeg": eeg,
+        "ecg": ecg[np.newaxis, :],
+        "gsr": gsr[np.newaxis, :],
+        "respiration": respiration[np.newaxis, :],
+    }

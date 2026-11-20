@@ -1,22 +1,75 @@
 import json
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
 from disentanglement.config import PreprocessingConfig, TrainingConfig
-from disentanglement.data_loading import build_trial_index
-from disentanglement.dataset import EmotionWindowDataset
+from disentanglement.data_loading import build_trial_index, resolve_labels_path
+from disentanglement.dataset import EmotionWindowDataset, RecordingGroupedSampler
 from disentanglement.models import MultimodalDisentanglement
 from disentanglement.normalization import fit_normalization
 from disentanglement.splits import build_partitions, save_split
-from disentanglement.dataset import RecordingGroupedSampler
-from disentanglement.train import evaluate, save_checkpoint, seed_everything, train_epoch
+from disentanglement.train import (
+    evaluate,
+    load_checkpoint,
+    save_checkpoint,
+    seed_everything,
+    train_epoch,
+)
+
+
+def _save_plots(history: list[dict], out_dir: Path) -> None:
+    epochs = [row["epoch"] for row in history]
+    loss_keys = (
+        "total",
+        "task",
+        "modality_similarity",
+        "modality_difference",
+        "modality_reconstruction",
+        "subject_difference",
+        "subject_reconstruction",
+    )
+    plt.figure(figsize=(10, 6))
+    for key in loss_keys:
+        column = f"train_{key}"
+        if column in history[0]:
+            plt.plot(epochs, [row[column] for row in history], label=column)
+    if "validation_loss" in history[0]:
+        plt.plot(epochs, [row["validation_loss"] for row in history], label="validation_loss", linestyle="--")
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / "loss_curves.png")
+    plt.close()
+
+    metric_keys = (
+        "accuracy",
+        "balanced_accuracy",
+        "macro_precision",
+        "macro_recall",
+        "macro_f1",
+    )
+    plt.figure(figsize=(10, 6))
+    for key in metric_keys:
+        column = f"validation_{key}"
+        if column in history[0]:
+            plt.plot(epochs, [row[column] for row in history], label=column)
+    plt.xlabel("epoch")
+    plt.ylabel("score")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / "validation_metrics.png")
+    plt.close()
 
 
 def process(data_dir: Path, out_dir: Path) -> None:
-    """Run bounded emotion training and write all experiment artifacts."""
     data_dir = Path(data_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -25,28 +78,28 @@ def process(data_dir: Path, out_dir: Path) -> None:
     training = TrainingConfig()
     seed_everything(training.seed)
 
-    labels = data_dir / "labels_train.csv"
-    if not labels.is_file():
-        labels = data_dir.parent / "labels_train.csv"
-    if not labels.is_file():
-        labels = data_dir.parent / "data" / "labels_train.csv"
-
-    trial_index = build_trial_index(data_dir, labels)
+    labels = resolve_labels_path(data_dir, training.labels_filename)
+    trial_index = build_trial_index(data_dir, labels, preprocessing)
+    if trial_index.empty:
+        raise ValueError("No valid preprocessed emotion trials were found")
     trial_index.to_csv(out_dir / "trial_index.csv", index=False)
-    trial_index = trial_index[
-        trial_index["final_emotion_label"].str.upper() != "TESTSUBJECT"
-    ].copy()
 
     emotions = sorted(trial_index["final_emotion_label"].dropna().unique().tolist())
     label_to_id = {emotion: index for index, emotion in enumerate(emotions)}
 
-    partitions = build_partitions(trial_index, train_fraction=0.8, seed=training.seed)
+    partitions = build_partitions(
+        trial_index,
+        train_fraction=training.train_fraction,
+        validation_fraction=training.validation_fraction,
+        seed=training.seed,
+    )
     save_split(
         {
             "train_subjects": set(partitions["train_subjects"]),
             "test_subjects": set(partitions["test_subjects"]),
             "train_videos": set(partitions["train_videos"]),
             "test_videos": set(partitions["test_videos"]),
+            "validation_pairs": set(partitions["validation_pairs"]),
         },
         out_dir / "split.json",
     )
@@ -75,12 +128,18 @@ def process(data_dir: Path, out_dir: Path) -> None:
             )
         ]
     ].copy()
+    if train_index.empty:
+        raise ValueError("No training trials remain after removing validation pairs")
+    if validation_index.empty:
+        raise ValueError("No validation trials were created from the training partition")
 
     normalization = fit_normalization(
         train_index,
         training_subjects,
         training_videos,
-        max_trials=64,
+        max_trials=training.max_normalization_trials,
+        seed=training.seed,
+        config=preprocessing,
     )
 
     np.savez(
@@ -99,7 +158,7 @@ def process(data_dir: Path, out_dir: Path) -> None:
         label_to_id,
         subject_to_id,
         normalization,
-        max_trials=0,
+        config=preprocessing,
     )
     validation_dataset = EmotionWindowDataset(
         validation_index,
@@ -108,7 +167,12 @@ def process(data_dir: Path, out_dir: Path) -> None:
         label_to_id,
         subject_to_id,
         normalization,
+        config=preprocessing,
     )
+    if not train_dataset.items:
+        raise ValueError("No training windows were created")
+    if not validation_dataset.items:
+        raise ValueError("No validation windows were created")
 
     train_sampler = RecordingGroupedSampler(
         train_dataset.items,
@@ -128,13 +192,25 @@ def process(data_dir: Path, out_dir: Path) -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    eeg_channels = 62
+    eeg_channels = int(train_index["n_eeg_channels"].mode().iloc[0])
     model = MultimodalDisentanglement(
         num_classes=len(label_to_id),
         eeg_channels=eeg_channels,
         training_subjects=sorted(private_subjects),
+        modalities=preprocessing.modalities,
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=training.learning_rate)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=training.learning_rate,
+        weight_decay=training.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=training.lr_scheduler_factor,
+        patience=training.lr_scheduler_patience,
+        min_lr=training.min_learning_rate,
+    )
     weights = {
         "alpha": training.alpha,
         "beta": training.beta,
@@ -144,23 +220,60 @@ def process(data_dir: Path, out_dir: Path) -> None:
     }
 
     history = []
-    best_accuracy = -1.0
+    best_metric = -float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
     for epoch in range(training.epochs):
         train_metrics = train_epoch(model, train_loader, optimizer, device, weights)
-        validation_metrics = evaluate(model, validation_loader, device)
+        validation_metrics = evaluate(
+            model,
+            validation_loader,
+            device,
+            num_classes=len(label_to_id),
+        )
+        metric = validation_metrics[training.primary_metric]
         row = {
             "epoch": epoch + 1,
             "device": str(device),
+            "learning_rate": optimizer.param_groups[0]["lr"],
             **{f"train_{key}": value for key, value in train_metrics.items()},
             **{f"validation_{key}": value for key, value in validation_metrics.items()},
         }
         history.append(row)
+        scheduler.step(metric)
 
-        if validation_metrics["accuracy"] > best_accuracy:
-            best_accuracy = validation_metrics["accuracy"]
-            save_checkpoint(model, optimizer, epoch + 1, out_dir / "best_model.pt")
-        save_checkpoint(model, optimizer, epoch + 1, out_dir / "final_model.pt")
+        if metric > best_metric + training.min_delta:
+            best_metric = metric
+            best_epoch = epoch + 1
+            epochs_without_improvement = 0
+            save_checkpoint(
+                model,
+                optimizer,
+                epoch + 1,
+                out_dir / "best_model.pt",
+                scheduler,
+            )
+        else:
+            epochs_without_improvement += 1
+        save_checkpoint(
+            model,
+            optimizer,
+            epoch + 1,
+            out_dir / "final_model.pt",
+            scheduler,
+        )
         print(f"epoch {epoch + 1}: {row}")
+        if epochs_without_improvement >= training.patience:
+            break
+
+    if (out_dir / "best_model.pt").is_file():
+        best_epoch = load_checkpoint(
+            model,
+            out_dir / "best_model.pt",
+            device,
+            optimizer,
+            scheduler,
+        )
 
     evaluation_metrics = {}
     for partition_name in ("A", "B", "C"):
@@ -174,6 +287,7 @@ def process(data_dir: Path, out_dir: Path) -> None:
             label_to_id,
             subject_to_id,
             normalization,
+            config=preprocessing,
         )
         partition_loader = DataLoader(
             partition_dataset,
@@ -185,6 +299,7 @@ def process(data_dir: Path, out_dir: Path) -> None:
             model,
             partition_loader,
             device,
+            num_classes=len(label_to_id),
             use_subject_ids=partition_name == "B",
         )
         partition_index.to_csv(
@@ -196,19 +311,46 @@ def process(data_dir: Path, out_dir: Path) -> None:
         encoding="utf-8",
     )
 
-    (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    history_frame = pd.DataFrame(history)
+    history_frame.to_csv(out_dir / "history.csv", index=False)
+    (out_dir / "history.json").write_text(
+        json.dumps(history, indent=2),
+        encoding="utf-8",
+    )
     (out_dir / "labels.json").write_text(
-        json.dumps(label_to_id, indent=2), encoding="utf-8"
+        json.dumps(label_to_id, indent=2),
+        encoding="utf-8",
+    )
+    (out_dir / "subjects.json").write_text(
+        json.dumps(subject_to_id, indent=2),
+        encoding="utf-8",
+    )
+    (out_dir / "model_config.json").write_text(
+        json.dumps(
+            {
+                "eeg_channels": eeg_channels,
+                "modalities": list(preprocessing.modalities),
+                "feature_dim": 128,
+                "num_classes": len(label_to_id),
+                "best_epoch": best_epoch,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
     )
     (out_dir / "training_config.json").write_text(
-        json.dumps(training.__dict__, indent=2), encoding="utf-8"
+        json.dumps(training.__dict__, indent=2),
+        encoding="utf-8",
     )
     (out_dir / "preprocessing_config.json").write_text(
-        json.dumps(preprocessing.__dict__, indent=2), encoding="utf-8"
+        json.dumps(preprocessing.__dict__, indent=2),
+        encoding="utf-8",
     )
+    _save_plots(history, out_dir)
 
     print(
         f"{len(trial_index)} valid trials; "
         f"{len(train_dataset)} train windows; "
-        f"{len(validation_dataset)} validation windows"
+        f"{len(validation_dataset)} validation windows; "
+        f"best epoch {best_epoch}"
     )

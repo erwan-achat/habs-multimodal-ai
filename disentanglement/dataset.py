@@ -1,12 +1,13 @@
 from collections import OrderedDict
 from pathlib import Path
+import random
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
-from torch.utils.data import Sampler
+from torch.utils.data import Dataset, Sampler
 
+from disentanglement.config import PreprocessingConfig
 from disentanglement.preprocessing import load_preprocessed_segment, window_offsets
 
 
@@ -19,8 +20,10 @@ class EmotionWindowDataset(Dataset):
         label_to_id: dict[str, int],
         subject_to_id: dict[str, int],
         normalization: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+        config: PreprocessingConfig | None = None,
         max_trials: int = 0,
     ):
+        self.config = config or PreprocessingConfig()
         self.trials = trial_index[
             trial_index["participant_id"].isin(partition_subjects)
             & trial_index["video"].isin(partition_videos)
@@ -38,12 +41,13 @@ class EmotionWindowDataset(Dataset):
                 continue
             for start_s, stop_s in window_offsets(
                 duration_s=float(trial.duration_s),
-                window_s=3.0,
-                stride_s=2.0,
+                window_s=self.config.window_duration_s,
+                stride_s=self.config.window_stride_s,
             ):
                 self.items.append({
                     "bdf_path": Path(trial.bdf_path),
                     "trial_start_s": float(trial.start_s),
+                    "trial_duration_s": float(trial.duration_s),
                     "window_start_s": float(start_s),
                     "window_stop_s": float(stop_s),
                     "label": label_to_id[emotion],
@@ -58,33 +62,44 @@ class EmotionWindowDataset(Dataset):
         item = self.items[index]
         bdf_path = item["bdf_path"]
         trial_start = float(item["trial_start_s"])
-        cache_key = (bdf_path, trial_start, 10.0)
+        trial_duration = float(item["trial_duration_s"])
+        cache_key = (bdf_path, trial_start, trial_duration)
         segment = self.cache.get(cache_key)
         if segment is None:
             segment = load_preprocessed_segment(
                 bdf_path,
                 start_s=trial_start,
-                duration_s=10.0,
+                duration_s=trial_duration,
+                config=self.config,
             )
             self.cache[cache_key] = segment
             if len(self.cache) > 3:
                 self.cache.popitem(last=False)
 
         start = item["window_start_s"]
-        eeg = segment["eeg"][:, round(start * 256):round(item["window_stop_s"] * 256)]
-        gsr = segment["gsr"][:, round(start * 32):round(item["window_stop_s"] * 32)]
-        respiration = segment["respiration"][:, round(start * 32):round(item["window_stop_s"] * 32)]
-
-        modality_data = {"eeg": eeg, "gsr": gsr, "respiration": respiration}
+        stop = item["window_stop_s"]
+        sfreqs = {
+            "eeg": self.config.eeg_sfreq,
+            "ecg": self.config.ecg_sfreq,
+            "gsr": self.config.gsr_sfreq,
+            "respiration": self.config.respiration_sfreq,
+        }
         tensors = {}
-        for modality, values in modality_data.items():
+        for modality in self.config.modalities:
+            sfreq = sfreqs[modality]
+            values = segment[modality][
+                :,
+                round(start * sfreq):round(stop * sfreq),
+            ]
             values = np.asarray(values, dtype=np.float32)
             if modality in self.normalization:
                 mean, std = self.normalization[modality]
-                if mean.shape[-1] == values.shape[-1]:
-                    values = (values - mean) / (std + 1e-6)
-                else:
-                    values = (values - mean.reshape(-1, 1)) / (std.reshape(-1, 1) + 1e-6)
+                mean = np.asarray(mean, dtype=np.float32)
+                std = np.asarray(std, dtype=np.float32)
+                if mean.shape != values.shape:
+                    mean = mean.reshape(-1, 1)
+                    std = std.reshape(-1, 1)
+                values = (values - mean) / (std + 1e-6)
             tensors[modality] = torch.from_numpy(np.asarray(values, dtype=np.float32))
 
         return {
@@ -95,22 +110,16 @@ class EmotionWindowDataset(Dataset):
 
 
 class RecordingGroupedSampler(Sampler[int]):
-    """Shuffle trials grouped by recording so each BDF stays opened briefly."""
-
     def __init__(self, items: list[dict], seed: int = 42):
-        import random
-
         self.items = items
         self.seed = seed
-        groups: dict[tuple[str, float], list[int]] = OrderedDict()
+        groups: dict[str, list[int]] = OrderedDict()
         for index, item in enumerate(items):
-            key = (str(item["bdf_path"]), float(item["trial_start_s"]))
+            key = str(item["bdf_path"])
             groups.setdefault(key, []).append(index)
         self.groups = list(groups.values())
 
     def __iter__(self):
-        import random
-
         rng = random.Random(self.seed)
         groups = [list(group) for group in self.groups]
         rng.shuffle(groups)

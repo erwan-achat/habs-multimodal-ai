@@ -3,6 +3,8 @@ from typing import Iterable
 import torch
 from torch import nn
 
+from disentanglement.config import MODALITIES
+
 
 class ModalityEncoder(nn.Module):
     def __init__(self, modality: str, channels: int, input_sfreq: int, feature_dim: int = 128):
@@ -34,12 +36,12 @@ class ModalityEncoder(nn.Module):
 
 
 class DisentangledMultimodal(nn.Module):
-    def __init__(self, feature_dim: int = 128):
+    def __init__(self, feature_dim: int = 128, num_modalities: int = len(MODALITIES)):
         super().__init__()
         self.shared = nn.Sequential(nn.Linear(feature_dim, feature_dim), nn.GELU())
         self.specific = nn.ModuleList([
             nn.Sequential(nn.Linear(feature_dim, feature_dim), nn.GELU())
-            for _ in range(3)
+            for _ in range(num_modalities)
         ])
         self.modality_reconstruction = nn.Sequential(
             nn.Linear(feature_dim, feature_dim), nn.GELU(), nn.Linear(feature_dim, feature_dim)
@@ -47,8 +49,14 @@ class DisentangledMultimodal(nn.Module):
 
     def forward(self, modality_features: list[torch.Tensor]) -> dict[str, torch.Tensor | list[torch.Tensor]]:
         invariant = [self.shared(item) for item in modality_features]
-        specific = [branch(item) for branch, item in zip(self.specific, modality_features, strict=True)]
-        reconstructed = [self.modality_reconstruction(item + spec) for item, spec in zip(invariant, specific, strict=True)]
+        specific = [
+            branch(item)
+            for branch, item in zip(self.specific, modality_features, strict=True)
+        ]
+        reconstructed = [
+            self.modality_reconstruction(item + spec)
+            for item, spec in zip(invariant, specific, strict=True)
+        ]
         return {"invariant": invariant, "specific": specific, "reconstructed": reconstructed}
 
 
@@ -68,7 +76,6 @@ class SubjectDisentanglement(nn.Module):
 
     def forward(self, fused: torch.Tensor, subject_indices: torch.Tensor | None) -> dict[str, torch.Tensor]:
         shared = self.shared(fused)
-        batch_size = fused.shape[0]
         if subject_indices is None:
             private = torch.zeros_like(shared)
         else:
@@ -87,14 +94,30 @@ class MultimodalDisentanglement(nn.Module):
         eeg_channels: int = 62,
         training_subjects: Iterable[str] | None = None,
         feature_dim: int = 128,
+        modalities: tuple[str, ...] = MODALITIES,
     ):
         super().__init__()
-        self.eeg_encoder = ModalityEncoder("eeg", eeg_channels, 256, feature_dim)
-        self.gsr_encoder = ModalityEncoder("gsr", 1, 32, feature_dim)
-        self.respiration_encoder = ModalityEncoder("respiration", 1, 32, feature_dim)
-        self.modality_disentanglement = DisentangledMultimodal(feature_dim)
+        self.modalities = tuple(modalities)
+        specs = {
+            "eeg": (eeg_channels, 256),
+            "ecg": (1, 256),
+            "gsr": (1, 32),
+            "respiration": (1, 32),
+        }
+        unknown = set(self.modalities).difference(specs)
+        if unknown:
+            raise ValueError(f"Unknown modalities: {sorted(unknown)}")
+        self.encoders = nn.ModuleDict({
+            name: ModalityEncoder(name, *specs[name], feature_dim)
+            for name in self.modalities
+        })
+        self.modality_disentanglement = DisentangledMultimodal(
+            feature_dim,
+            num_modalities=len(self.modalities),
+        )
 
         tokens = feature_dim
+        self.token_type = nn.Parameter(torch.zeros(1, 2 * len(self.modalities), tokens))
         self.fusion = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=tokens, nhead=8, batch_first=True),
             num_layers=1,
@@ -112,20 +135,19 @@ class MultimodalDisentanglement(nn.Module):
         subject_ids: torch.Tensor | None = None,
         return_components: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor | list[torch.Tensor]]:
-        eeg = self.eeg_encoder(inputs["eeg"])
-        gsr = self.gsr_encoder(inputs["gsr"])
-        respiration = self.respiration_encoder(inputs["respiration"])
-        modality_features = [eeg, gsr, respiration]
+        modality_features = [
+            self.encoders[name](inputs[name])
+            for name in self.modalities
+        ]
         modality = self.modality_disentanglement(modality_features)
-
         invariant = modality["invariant"]
         specific = modality["specific"]
         tokens = torch.cat([
             torch.stack([inv, spec], dim=1)
             for inv, spec in zip(invariant, specific, strict=True)
         ], dim=1)
-        fused_tokens = self.fusion(tokens)
-        fused = fused_tokens.mean(dim=1)
+        tokens = tokens + self.token_type
+        fused = self.fusion(tokens).mean(dim=1)
 
         subject = self.subject_disentanglement(fused, subject_ids)
         logits = self.classifier(subject["shared"])
