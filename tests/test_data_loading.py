@@ -6,7 +6,10 @@ import numpy as np
 import pandas as pd
 
 from disentanglement.data_loading import build_trial_index
-from disentanglement.dataset import RecordingGroupedSampler
+from disentanglement.dataset import (
+    EpochTrialSubsetSampler,
+    RecordingGroupedSampler,
+)
 from disentanglement.preprocessing import window_offsets
 from disentanglement.splits import build_partitions
 
@@ -296,6 +299,36 @@ def test_recording_grouped_sampler_preserves_full_window_coverage() -> None:
 
     assert sorted(order) == [0, 1, 2]
     assert order.index(0) + 1 == order.index(1) or order.index(1) + 1 == order.index(0)
+
+
+def test_epoch_trial_sampler_resamples_complete_trials_and_changes_between_epochs() -> None:
+    items = []
+    for trial in range(6):
+        for window in range(4):
+            items.append({
+                "bdf_path": f"P{trial // 2}.bdf",
+                "trial_start_s": float(trial),
+                "trial_duration_s": 10.0,
+            })
+
+    sampler = EpochTrialSubsetSampler(items, trials_per_epoch=3, seed=42)
+    sampler.set_epoch(0)
+    epoch_zero = list(sampler)
+    sampler.set_epoch(1)
+    epoch_one = list(sampler)
+
+    selected_zero = {
+        items[index]["trial_start_s"]
+        for index in epoch_zero
+    }
+    selected_one = {
+        items[index]["trial_start_s"]
+        for index in epoch_one
+    }
+    assert len(selected_zero) == 3
+    assert len(selected_one) == 3
+    assert selected_zero != selected_one
+    assert len(epoch_zero) == 12
 
 
 def test_subject_video_partitions_are_disjoint() -> None:

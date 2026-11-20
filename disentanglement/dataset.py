@@ -131,3 +131,71 @@ class RecordingGroupedSampler(Sampler[int]):
 
     def __len__(self) -> int:
         return len(self.items)
+
+
+class EpochTrialSubsetSampler(Sampler[int]):
+    def __init__(
+        self,
+        items: list[dict],
+        trials_per_epoch: int = 512,
+        trial_fraction_per_epoch: float = 0.0,
+        seed: int = 42,
+    ):
+        self.items = items
+        self.trials_per_epoch = trials_per_epoch
+        self.trial_fraction_per_epoch = trial_fraction_per_epoch
+        self.seed = seed
+        self.epoch = 0
+
+        trial_groups: dict[tuple[str, float, float], list[int]] = OrderedDict()
+        for index, item in enumerate(items):
+            trial_key = (
+                str(item["bdf_path"]),
+                float(item["trial_start_s"]),
+                float(item["trial_duration_s"]),
+            )
+            trial_groups.setdefault(trial_key, []).append(index)
+        self.trial_groups = list(trial_groups.values())
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _selected_groups(self) -> list[list[int]]:
+        trial_count = len(self.trial_groups)
+        if trial_count == 0:
+            return []
+        if self.trials_per_epoch > 0:
+            selected_count = min(trial_count, self.trials_per_epoch)
+        elif self.trial_fraction_per_epoch > 0.0:
+            selected_count = max(
+                1,
+                min(trial_count, round(trial_count * self.trial_fraction_per_epoch)),
+            )
+        else:
+            selected_count = trial_count
+
+        rng = random.Random(self.seed + self.epoch)
+        trial_groups = [list(group) for group in self.trial_groups]
+        rng.shuffle(trial_groups)
+        return trial_groups[:selected_count]
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        selected = self._selected_groups()
+        recording_groups: dict[str, list[list[int]]] = OrderedDict()
+        for group in selected:
+            bdf_path = str(self.items[group[0]]["bdf_path"])
+            recording_groups.setdefault(bdf_path, []).append(group)
+
+        recordings = list(recording_groups.values())
+        rng.shuffle(recordings)
+        order: list[int] = []
+        for trial_groups in recordings:
+            rng.shuffle(trial_groups)
+            for group in trial_groups:
+                rng.shuffle(group)
+                order.extend(group)
+        return iter(order)
+
+    def __len__(self) -> int:
+        return sum(len(group) for group in self._selected_groups())

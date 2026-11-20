@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from disentanglement.config import PreprocessingConfig, TrainingConfig
 from disentanglement.data_loading import build_trial_index, resolve_labels_path
-from disentanglement.dataset import EmotionWindowDataset, RecordingGroupedSampler
+from disentanglement.dataset import EpochTrialSubsetSampler, EmotionWindowDataset
 from disentanglement.models import MultimodalDisentanglement
 from disentanglement.normalization import fit_normalization
 from disentanglement.splits import build_partitions, save_split
@@ -174,8 +174,10 @@ def process(data_dir: Path, out_dir: Path) -> None:
     if not validation_dataset.items:
         raise ValueError("No validation windows were created")
 
-    train_sampler = RecordingGroupedSampler(
+    train_sampler = EpochTrialSubsetSampler(
         train_dataset.items,
+        trials_per_epoch=training.trials_per_epoch,
+        trial_fraction_per_epoch=training.trial_fraction_per_epoch,
         seed=training.seed,
     )
     train_loader = DataLoader(
@@ -224,6 +226,7 @@ def process(data_dir: Path, out_dir: Path) -> None:
     best_epoch = 0
     epochs_without_improvement = 0
     for epoch in range(training.epochs):
+        train_sampler.set_epoch(epoch)
         train_metrics = train_epoch(model, train_loader, optimizer, device, weights)
         validation_metrics = evaluate(
             model,

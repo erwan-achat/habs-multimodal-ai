@@ -240,6 +240,9 @@ Requirements:
   category or by a normalized video name.
 - Keep all windows and repeated recordings from a subject-video pair within the same partition.
 - Reserve validation data exclusively from the training partitions for hyperparameter selection.
+- Each epoch may sample a configurable subset of complete trials from
+  `S_train × V_train`; resample reproducibly per epoch without moving trials
+  between partitions.
 - Never use evaluation partitions A, B or C for model selection.
 - Fit normalization statistics and learned preprocessing transformations exclusively on training data.
 - Subject-private encoders must not be required for inference on unseen subjects.
