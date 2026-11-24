@@ -30,10 +30,9 @@ def train_epoch(model, loader: DataLoader, optimizer, device, weights: dict[str,
     for batch in loader:
         inputs = {name: batch[name].to(device) for name in model.modalities}
         targets = batch["label"].to(device)
-        subjects = batch["subject"].to(device)
 
         optimizer.zero_grad(set_to_none=True)
-        components = model(inputs, subjects, return_components=True)
+        components = model(inputs, return_components=True)
         loss, values = total_loss(components, targets, weights)
         loss.backward()
         optimizer.step()
@@ -49,7 +48,6 @@ def evaluate(
     loader: DataLoader,
     device,
     num_classes: int,
-    use_subject_ids: bool = True,
 ) -> dict[str, float]:
     model.eval()
     predictions: list[int] = []
@@ -58,8 +56,7 @@ def evaluate(
     for batch in loader:
         inputs = {name: batch[name].to(device) for name in model.modalities}
         targets = batch["label"].to(device)
-        subjects = batch["subject"].to(device) if use_subject_ids else None
-        logits = model(inputs, subjects)
+        logits = model(inputs)
         loss_values.append(F.cross_entropy(logits, targets).item())
         predictions.extend(logits.argmax(dim=-1).cpu().tolist())
         labels.extend(targets.cpu().tolist())

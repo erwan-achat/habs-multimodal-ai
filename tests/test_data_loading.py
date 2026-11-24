@@ -6,12 +6,9 @@ import numpy as np
 import pandas as pd
 
 from disentanglement.data_loading import build_trial_index
-from disentanglement.dataset import (
-    EpochTrialSubsetSampler,
-    RecordingGroupedSampler,
-)
+from disentanglement.dataset import RecordingGroupedSampler
 from disentanglement.preprocessing import window_offsets
-from disentanglement.splits import build_partitions
+from disentanglement.splits import build_subject_partitions
 
 
 def _write_record_map(path: Path, n_eeg: int = 62) -> None:
@@ -290,9 +287,9 @@ def test_trial_index_rejects_marker_segment_beyond_bdf(tmp_path: Path, monkeypat
 
 def test_recording_grouped_sampler_preserves_full_window_coverage() -> None:
     items = [
-        {"bdf_path": "P001.bdf", "trial_start_s": 10.0},
-        {"bdf_path": "P001.bdf", "trial_start_s": 10.0},
-        {"bdf_path": "P002.bdf", "trial_start_s": 20.0},
+        {"bdf_path": "P001.bdf", "trial_start_s": 10.0, "trial_duration_s": 10.0},
+        {"bdf_path": "P001.bdf", "trial_start_s": 10.0, "trial_duration_s": 10.0},
+        {"bdf_path": "P002.bdf", "trial_start_s": 20.0, "trial_duration_s": 10.0},
     ]
     sampler = RecordingGroupedSampler(items, seed=42)
     order = list(sampler)
@@ -301,52 +298,57 @@ def test_recording_grouped_sampler_preserves_full_window_coverage() -> None:
     assert order.index(0) + 1 == order.index(1) or order.index(1) + 1 == order.index(0)
 
 
-def test_epoch_trial_sampler_resamples_complete_trials_and_changes_between_epochs() -> None:
-    items = []
-    for trial in range(6):
-        for window in range(4):
-            items.append({
-                "bdf_path": f"P{trial // 2}.bdf",
-                "trial_start_s": float(trial),
-                "trial_duration_s": 10.0,
-            })
-
-    sampler = EpochTrialSubsetSampler(items, trials_per_epoch=3, seed=42)
-    sampler.set_epoch(0)
-    epoch_zero = list(sampler)
-    sampler.set_epoch(1)
-    epoch_one = list(sampler)
-
-    selected_zero = {
-        items[index]["trial_start_s"]
-        for index in epoch_zero
-    }
-    selected_one = {
-        items[index]["trial_start_s"]
-        for index in epoch_one
-    }
-    assert len(selected_zero) == 3
-    assert len(selected_one) == 3
-    assert selected_zero != selected_one
-    assert len(epoch_zero) == 12
-
-
-def test_subject_video_partitions_are_disjoint() -> None:
-    trial_index = pd.DataFrame({
-        "participant_id": ["S1", "S1", "S2", "S2"],
-        "video": ["V1", "V2", "V1", "V2"],
+def test_subject_video_partitions_are_balanced_disjoint_and_reproducible() -> None:
+    demographics = pd.DataFrame({
+        "participant_id": [f"P{i:03}" for i in range(40)],
+        "gender": ["female"] * 20 + ["male"] * 20,
     })
-    partitions = build_partitions(trial_index, train_fraction=0.5, seed=42)
+    trial_index = pd.DataFrame({
+        "participant_id": [f"P{i:03}" for i in range(40) for _ in range(10)],
+        "video": [f"V{j:02}" for _ in range(40) for j in range(10)],
+        "trial": list(range(400)),
+    })
 
-    train = partitions["train"]
-    a = partitions["A"]
-    b = partitions["B"]
-    c = partitions["C"]
-    train_subjects = set(train["participant_id"])
-    train_videos = set(train["video"])
-    assert set(a["video"]) <= train_videos
-    assert set(a["participant_id"]).isdisjoint(train_subjects)
-    assert set(b["participant_id"]) <= train_subjects
-    assert set(b["video"]).isdisjoint(train_videos)
-    assert set(c["participant_id"]).isdisjoint(train_subjects)
-    assert set(c["video"]).isdisjoint(train_videos)
+    partitions = build_subject_partitions(
+        trial_index,
+        demographics,
+        subject_count=20,
+        validation_fraction=0.2,
+        seed=42,
+    )
+    repeated = build_subject_partitions(
+        trial_index,
+        demographics,
+        subject_count=20,
+        validation_fraction=0.2,
+        seed=42,
+    )
+
+    train_subjects = set(partitions["train_subjects"])
+    validation_subjects = set(partitions["validation_subjects"])
+    assert len(train_subjects | validation_subjects) == 20
+    assert len(train_subjects) == 16
+    assert len(validation_subjects) == 4
+    assert train_subjects.isdisjoint(validation_subjects)
+    assert len(partitions["train_videos"]) == 8
+    assert len(partitions["validation_videos"]) == 2
+    assert set(partitions["train_videos"]).isdisjoint(partitions["validation_videos"])
+    assert set(partitions["train"]["participant_id"]) == train_subjects
+    assert set(partitions["train"]["video"]) == set(partitions["train_videos"])
+    assert set(partitions["validation"]["participant_id"]) == validation_subjects
+    assert set(partitions["validation"]["video"]) == set(partitions["validation_videos"])
+    assert set(partitions["A"]["participant_id"]) == validation_subjects
+    assert set(partitions["A"]["video"]) == set(partitions["train_videos"])
+    assert set(partitions["B"]["participant_id"]) == train_subjects
+    assert set(partitions["B"]["video"]) == set(partitions["validation_videos"])
+    assert set(partitions["C"]["participant_id"]) == validation_subjects
+    assert set(partitions["C"]["video"]) == set(partitions["validation_videos"])
+    assert partitions["train_genders"] == repeated["train_genders"]
+    assert train_subjects == set(repeated["train_subjects"])
+    assert validation_subjects == set(repeated["validation_subjects"])
+    assert partitions["train_videos"] == repeated["train_videos"]
+    assert partitions["validation_videos"] == repeated["validation_videos"]
+    assert sum(gender == "female" for gender in partitions["train_genders"].values()) == 8
+    assert sum(gender == "male" for gender in partitions["train_genders"].values()) == 8
+    assert sum(gender == "female" for gender in partitions["validation_genders"].values()) == 2
+    assert sum(gender == "male" for gender in partitions["validation_genders"].values()) == 2

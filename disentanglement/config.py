@@ -20,14 +20,13 @@ class PreprocessingConfig:
 class TrainingConfig:
     labels_filename: str = "labels_train.csv"
     batch_size: int = 32
-    epochs: int = 5
-    trials_per_epoch: int = 512
-    trial_fraction_per_epoch: float = 0.0
+    epochs: int = 10
+    subject_count: int = 20
+    video_train_fraction: float = 0.8
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
     seed: int = 42
     num_workers: int = 0
-    train_fraction: float = 0.8
     validation_fraction: float = 0.2
     max_normalization_trials: int = 64
     primary_metric: str = "macro_f1"
@@ -39,5 +38,3 @@ class TrainingConfig:
     alpha: float = 0.002
     beta: float = 0.1
     gamma: float = 0.04
-    delta: float = 0.5
-    epsilon: float = 0.05

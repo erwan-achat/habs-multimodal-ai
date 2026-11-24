@@ -11,10 +11,10 @@ from torch.utils.data import DataLoader
 
 from disentanglement.config import PreprocessingConfig, TrainingConfig
 from disentanglement.data_loading import build_trial_index, resolve_labels_path
-from disentanglement.dataset import EpochTrialSubsetSampler, EmotionWindowDataset
+from disentanglement.dataset import EmotionWindowDataset, RecordingGroupedSampler
 from disentanglement.models import MultimodalDisentanglement
 from disentanglement.normalization import fit_normalization
-from disentanglement.splits import build_partitions, save_split
+from disentanglement.splits import build_subject_partitions, save_split
 from disentanglement.train import (
     evaluate,
     load_checkpoint,
@@ -32,8 +32,6 @@ def _save_plots(history: list[dict], out_dir: Path) -> None:
         "modality_similarity",
         "modality_difference",
         "modality_reconstruction",
-        "subject_difference",
-        "subject_reconstruction",
     )
     plt.figure(figsize=(10, 6))
     for key in loss_keys:
@@ -87,51 +85,36 @@ def process(data_dir: Path, out_dir: Path) -> None:
     emotions = sorted(trial_index["final_emotion_label"].dropna().unique().tolist())
     label_to_id = {emotion: index for index, emotion in enumerate(emotions)}
 
-    partitions = build_partitions(
+    partitions = build_subject_partitions(
         trial_index,
-        train_fraction=training.train_fraction,
+        pd.read_csv(labels),
+        subject_count=training.subject_count,
+        video_train_fraction=training.video_train_fraction,
         validation_fraction=training.validation_fraction,
         seed=training.seed,
     )
     save_split(
         {
             "train_subjects": set(partitions["train_subjects"]),
-            "test_subjects": set(partitions["test_subjects"]),
+            "validation_subjects": set(partitions["validation_subjects"]),
             "train_videos": set(partitions["train_videos"]),
-            "test_videos": set(partitions["test_videos"]),
-            "validation_pairs": set(partitions["validation_pairs"]),
+            "validation_videos": set(partitions["validation_videos"]),
+            "train_genders": partitions["train_genders"],
+            "validation_genders": partitions["validation_genders"],
         },
         out_dir / "split.json",
     )
 
     training_subjects = set(partitions["train_subjects"])
+    validation_subjects = set(partitions["validation_subjects"])
     training_videos = set(partitions["train_videos"])
-    private_subjects = training_subjects
+    validation_videos = set(partitions["validation_videos"])
+    train_index = partitions["train"]
     validation_index = partitions["validation"]
-
-    subject_to_id = {
-        subject: index
-        for index, subject in enumerate(sorted(private_subjects))
-    }
-
-    train_index = partitions["train"].copy()
-    validation_pairs = set(
-        zip(validation_index["participant_id"], validation_index["video"], strict=True)
-    )
-    train_index = train_index[
-        [
-            (participant, video) not in validation_pairs
-            for participant, video in zip(
-                train_index["participant_id"],
-                train_index["video"],
-                strict=True,
-            )
-        ]
-    ].copy()
     if train_index.empty:
-        raise ValueError("No training trials remain after removing validation pairs")
+        raise ValueError("No training trials found for selected subjects")
     if validation_index.empty:
-        raise ValueError("No validation trials were created from the training partition")
+        raise ValueError("No validation trials found for selected subjects")
 
     normalization = fit_normalization(
         train_index,
@@ -156,16 +139,14 @@ def process(data_dir: Path, out_dir: Path) -> None:
         training_subjects,
         training_videos,
         label_to_id,
-        subject_to_id,
         normalization,
         config=preprocessing,
     )
     validation_dataset = EmotionWindowDataset(
         validation_index,
-        set(validation_index["participant_id"].unique()),
-        set(validation_index["video"].unique()),
+        validation_subjects,
+        validation_videos,
         label_to_id,
-        subject_to_id,
         normalization,
         config=preprocessing,
     )
@@ -174,10 +155,8 @@ def process(data_dir: Path, out_dir: Path) -> None:
     if not validation_dataset.items:
         raise ValueError("No validation windows were created")
 
-    train_sampler = EpochTrialSubsetSampler(
+    train_sampler = RecordingGroupedSampler(
         train_dataset.items,
-        trials_per_epoch=training.trials_per_epoch,
-        trial_fraction_per_epoch=training.trial_fraction_per_epoch,
         seed=training.seed,
     )
     train_loader = DataLoader(
@@ -198,7 +177,6 @@ def process(data_dir: Path, out_dir: Path) -> None:
     model = MultimodalDisentanglement(
         num_classes=len(label_to_id),
         eeg_channels=eeg_channels,
-        training_subjects=sorted(private_subjects),
         modalities=preprocessing.modalities,
     ).to(device)
     optimizer = torch.optim.Adam(
@@ -217,8 +195,6 @@ def process(data_dir: Path, out_dir: Path) -> None:
         "alpha": training.alpha,
         "beta": training.beta,
         "gamma": training.gamma,
-        "delta": training.delta,
-        "epsilon": training.epsilon,
     }
 
     history = []
@@ -278,17 +254,28 @@ def process(data_dir: Path, out_dir: Path) -> None:
             scheduler,
         )
 
-    evaluation_metrics = {}
-    for partition_name in ("A", "B", "C"):
+    evaluation_metrics = {
+        "C": evaluate(
+            model,
+            validation_loader,
+            device,
+            num_classes=len(label_to_id),
+        )
+    }
+    validation_index.to_csv(out_dir / "partition_C.csv", index=False)
+    for partition_name in ("A", "B"):
         partition_index = partitions[partition_name]
-        partition_subjects = set(partition_index["participant_id"].unique())
-        partition_videos = set(partition_index["video"].unique())
+        partition_subjects = (
+            validation_subjects if partition_name == "A" else training_subjects
+        )
+        partition_videos = (
+            training_videos if partition_name == "A" else validation_videos
+        )
         partition_dataset = EmotionWindowDataset(
             partition_index,
             partition_subjects,
             partition_videos,
             label_to_id,
-            subject_to_id,
             normalization,
             config=preprocessing,
         )
@@ -303,12 +290,12 @@ def process(data_dir: Path, out_dir: Path) -> None:
             partition_loader,
             device,
             num_classes=len(label_to_id),
-            use_subject_ids=partition_name == "B",
         )
         partition_index.to_csv(
             out_dir / f"partition_{partition_name}.csv",
             index=False,
         )
+
     (out_dir / "evaluation.json").write_text(
         json.dumps(evaluation_metrics, indent=2),
         encoding="utf-8",
@@ -322,10 +309,6 @@ def process(data_dir: Path, out_dir: Path) -> None:
     )
     (out_dir / "labels.json").write_text(
         json.dumps(label_to_id, indent=2),
-        encoding="utf-8",
-    )
-    (out_dir / "subjects.json").write_text(
-        json.dumps(subject_to_id, indent=2),
         encoding="utf-8",
     )
     (out_dir / "model_config.json").write_text(

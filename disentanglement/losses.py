@@ -57,29 +57,18 @@ def total_loss(
         )
     )
 
-    subject_difference = orthogonality_loss(
-        components["shared"], components["private"]
-    )
-    subject_reconstruction = F.mse_loss(
-        components["subject_reconstructed"], components["fused"]
-    )
-
     modality_similarity = central_moment_discrepancy(invariant)
     total = (
         task
         + weights["alpha"] * modality_similarity
         + weights["beta"] * modality_difference
         + weights["gamma"] * modality_reconstruction
-        + weights["delta"] * subject_difference
-        + weights["epsilon"] * subject_reconstruction
     )
     values = {
         "task": task.detach().item(),
         "modality_similarity": modality_similarity.detach().item(),
         "modality_difference": modality_difference.detach().item(),
         "modality_reconstruction": modality_reconstruction.detach().item(),
-        "subject_difference": subject_difference.detach().item(),
-        "subject_reconstruction": subject_reconstruction.detach().item(),
         "total": total.detach().item(),
     }
     return total, values

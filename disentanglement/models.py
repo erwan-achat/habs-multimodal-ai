@@ -1,5 +1,3 @@
-from typing import Iterable
-
 import torch
 from torch import nn
 
@@ -60,39 +58,11 @@ class DisentangledMultimodal(nn.Module):
         return {"invariant": invariant, "specific": specific, "reconstructed": reconstructed}
 
 
-class SubjectDisentanglement(nn.Module):
-    def __init__(self, feature_dim: int = 128, training_subjects: Iterable[str] | None = None):
-        super().__init__()
-        self.shared = nn.Sequential(nn.Linear(feature_dim, feature_dim), nn.GELU())
-        subjects = list(training_subjects or [])
-        self.subject_ids = {subject: index for index, subject in enumerate(subjects)}
-        self.private = nn.ModuleList([
-            nn.Sequential(nn.Linear(feature_dim, feature_dim), nn.GELU())
-            for _ in subjects
-        ])
-        self.reconstruction = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim), nn.GELU(), nn.Linear(feature_dim, feature_dim)
-        )
-
-    def forward(self, fused: torch.Tensor, subject_indices: torch.Tensor | None) -> dict[str, torch.Tensor]:
-        shared = self.shared(fused)
-        if subject_indices is None:
-            private = torch.zeros_like(shared)
-        else:
-            private = torch.stack([
-                self.private[int(index)](fused_row)
-                for index, fused_row in zip(subject_indices.cpu(), fused)
-            ]) if len(subject_indices) else torch.zeros_like(shared)
-        reconstructed = self.reconstruction(shared + private)
-        return {"shared": shared, "private": private, "subject_reconstructed": reconstructed}
-
-
 class MultimodalDisentanglement(nn.Module):
     def __init__(
         self,
         num_classes: int = 12,
         eeg_channels: int = 62,
-        training_subjects: Iterable[str] | None = None,
         feature_dim: int = 128,
         modalities: tuple[str, ...] = MODALITIES,
     ):
@@ -119,10 +89,9 @@ class MultimodalDisentanglement(nn.Module):
         tokens = feature_dim
         self.token_type = nn.Parameter(torch.zeros(1, 2 * len(self.modalities), tokens))
         self.fusion = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=tokens, nhead=8, batch_first=True),
+            nn.TransformerEncoderLayer(d_model=tokens, nhead=1, batch_first=True),
             num_layers=1,
         )
-        self.subject_disentanglement = SubjectDisentanglement(feature_dim, training_subjects)
         self.classifier = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
             nn.GELU(),
@@ -132,7 +101,6 @@ class MultimodalDisentanglement(nn.Module):
     def forward(
         self,
         inputs: dict[str, torch.Tensor],
-        subject_ids: torch.Tensor | None = None,
         return_components: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor | list[torch.Tensor]]:
         modality_features = [
@@ -149,8 +117,7 @@ class MultimodalDisentanglement(nn.Module):
         tokens = tokens + self.token_type
         fused = self.fusion(tokens).mean(dim=1)
 
-        subject = self.subject_disentanglement(fused, subject_ids)
-        logits = self.classifier(subject["shared"])
+        logits = self.classifier(fused)
         if not return_components:
             return logits
         return {
@@ -158,5 +125,4 @@ class MultimodalDisentanglement(nn.Module):
             "modality_features": modality_features,
             **modality,
             "fused": fused,
-            **subject,
         }

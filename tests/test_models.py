@@ -1,5 +1,6 @@
 import torch
 
+from disentanglement.losses import total_loss
 from disentanglement.models import ModalityEncoder, MultimodalDisentanglement
 
 
@@ -24,7 +25,6 @@ def test_full_model_forward_and_backward() -> None:
     model = MultimodalDisentanglement(
         num_classes=12,
         eeg_channels=62,
-        training_subjects=["P001", "P002"],
     )
     inputs = {
         "eeg": torch.randn(2, 62, 768),
@@ -32,13 +32,27 @@ def test_full_model_forward_and_backward() -> None:
         "gsr": torch.randn(2, 1, 96),
         "respiration": torch.randn(2, 1, 96),
     }
-    components = model(inputs, subject_ids=torch.tensor([0, 1]), return_components=True)
-    loss = components["logits"].square().mean()
+    components = model(inputs, return_components=True)
+    loss, metrics = total_loss(
+        components,
+        torch.tensor([0, 1]),
+        {"alpha": 0.002, "beta": 0.1, "gamma": 0.04},
+    )
     loss.backward()
 
     assert components["logits"].shape == (2, 12)
+    assert model.fusion.layers[0].self_attn.num_heads == 1
     assert len(components["invariant"]) == 4
     assert len(components["specific"]) == 4
+    assert "private" not in components
+    assert "subject_reconstructed" not in components
+    assert set(metrics) == {
+        "task",
+        "modality_similarity",
+        "modality_difference",
+        "modality_reconstruction",
+        "total",
+    }
 
 
 def test_model_supports_modality_ablation() -> None:

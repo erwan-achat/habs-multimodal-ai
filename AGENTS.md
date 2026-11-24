@@ -22,8 +22,8 @@ Our implementation will use four modalities:
 
 The main objectives are:
 - Learn modality-invariant and modality-specific representations.
-- Separate subject-shared and subject-specific representations.
-- Improve cross-subject emotion recognition.
+- Validate cross-subject emotion recognition with subject-disjoint training
+  and validation sets.
 - Preserve the possibility to add feature engineering, performing ablation studies, and explore temporal evolutions of emotions later on.
 
 ## 3. Dataset-specific rules
@@ -32,10 +32,10 @@ The main objectives are:
   repository; local development uses `sample/`, while GPU jobs read `/data`.
 - Load dataset metadata and labels before signal files, then build only a trial/window index.
 - Implement lazy `Dataset` loading: open one participant recording, extract one
-  10-second trial and its 3-second windows, then release or cache it according
+  marker-bounded video trial and its 3-second windows, then release or cache it according
   to memory limits. Never load the full 300+ GB dataset into memory.
 - Exclude gaze data completely; it must not enter preprocessing, training or inference.
-- Each 10-second video-viewing segment maps to one `final_emotion` target among 12 emotions, including neutral.
+- Each video-viewing segment maps to one `final_emotion` target among 12 emotions, including neutral.
 - Read trial annotations from `labels_train.csv`.
 - Exclude recording trials flagged with `1` or the released `TESTSUBJECT` sentinel in `labels_train.csv`.
 - Reconstruct segment boundaries from recording metadata and event/marker
@@ -162,51 +162,25 @@ For four modalities, this produces eight feature tokens:
 
 Apply Multi-Head Self-Attention to model interactions between these representations.
 
-The resulting fused representation is the input to the subject-level disentanglement module.
+The resulting fused representation is the input to the emotion classifier.
 
-## 8. Subject-level disentanglement
+## 8. Subject handling
 
-Separate the fused representation into:
-
-- **Subject-shared:** information common across subjects.
-- **Subject-private:** information specific to individual subjects.
-
-### 8.1 Encoders
-
-Implement:
-
-- One subject-shared encoder with shared parameters across subjects.
-- One independent subject-private encoder per training subject, with independent parameters.
-
-Both branches must produce representations of the same dimension.
-
-The subject-shared representation is used for emotion classification. Subject-private representations are used exclusively for disentanglement and reconstruction constraints.
-
-The cross-subject inference process must support previously unseen subjects. Subject-private encoders must not be required for classification.
-
-### 8.2 Losses
-
-**Subject difference loss (`L_s_diff`)**
-
-Use an orthogonality constraint to separate subject-shared and subject-private representations.
-
-**Subject reconstruction loss (`L_s_recon`)**
-
-Use a decoder to reconstruct the original fused representation from the sum of subject-shared and subject-private representations.
-
-Minimize reconstruction error using MSE.
+Do not implement subject-shared/private encoders or subject disentanglement
+losses in this experiment. Evaluate cross-subject generalization with
+participant-disjoint training and validation sets.
 
 ## 9. Classification and objective function
 
-Use the subject-shared representation as input to the classification head.
+Use the fused multimodal representation as input to the classification head.
 
 The classification objective must support the emotion prediction targets defined by the experiment.
 
 Use cross-entropy for classification.
 
-The total training objective is:
+The modality-disentanglement training objective is:
 
-`L = L_task + Î± L_m_sim + Î² L_m_diff + Î³ L_m_recon + Î´ L_s_diff + Îµ L_s_recon`
+`L = L_task + Î± L_m_sim + Î² L_m_diff + Î³ L_m_recon`
 
 All loss weights must be configurable.
 
@@ -215,38 +189,25 @@ Initial reference weights from the MDNet paper:
 - Î± = 0.002
 - Î² = 0.1
 - Î³ = 0.04
-- Î´ = 0.5
-- Îµ = 0.05
-
 These values are just a starting point.
 
 ## 10. Evaluation and experimentation
 
-Evaluate three distinct generalization capabilities using a subject-video split:
+For the current small-scale experiment, select 20 participants reproducibly
+from valid trial candidates: 10 female and 10 male. Split participants into 16
+training and 4 held-out validation subjects, preserving an 8/2 gender balance
+in each set. No age field is available in this repository, so age
+stratification is not part of this run.
 
-- **A â€” Subject generalization:** unseen subjects, known videos (`S_test Ã— V_train`).
-- **B â€” Video generalization:** known subjects, unseen videos (`S_train Ã— V_test`).
-- **C â€” Joint generalization:** unseen subjects, unseen videos (`S_test Ã— V_test`).
+Independently split the selected cohort's exact video identifiers 80/20 into
+`V_train` and `V_test`. Train on `S_train × V_train`; use `S_test × V_test` (C)
+as the held-out validation set for checkpoint selection. This ensures neither
+subjects nor videos overlap between training and validation. Keep A
+(`S_test × V_train`) and B (`S_train × V_test`) as post-training diagnostics
+only. Use all valid trials and windows within each partition, keep video IDs
+atomic, and fit normalization only on `S_train × V_train`. Train for at most 10
+epochs, with early stopping retained.
 
-Training must exclusively use `S_train Ã— V_train`.
-
-Requirements:
-- As an initial configuration, split subjects and videos independently with an
-  80/20 train/test proportion, and reserve a validation subset only from the
-  80% training partition.
-- Create splits from participant and video identifiers before indexing windows;
-  do not use random window-level splits or shuffle windows across partitions.
-- Treat each `video` identifier as an atomic unit; do not split by emotion
-  category or by a normalized video name.
-- Keep all windows and repeated recordings from a subject-video pair within the same partition.
-- Reserve validation data exclusively from the training partitions for hyperparameter selection.
-- Each epoch may sample a configurable subset of complete trials from
-  `S_train × V_train`; resample reproducibly per epoch without moving trials
-  between partitions.
-- Never use evaluation partitions A, B or C for model selection.
-- Fit normalization statistics and learned preprocessing transformations exclusively on training data.
-- Subject-private encoders must not be required for inference on unseen subjects.
-- Report metrics separately for A, B and C.
 - Support ablation studies to evaluate the contribution of each modality, disentanglement module and loss term.
 - Keep experimental parameters configurable and results reproducible.
 
@@ -299,22 +260,17 @@ Track and record the following losses at every epoch:
 - Modality similarity loss (`L_m_sim`).
 - Modality difference loss (`L_m_diff`).
 - Modality reconstruction loss (`L_m_recon`).
-- Subject difference loss (`L_s_diff`).
-- Subject reconstruction loss (`L_s_recon`).
 - Total loss.
 
-Record training and validation classification losses separately. Disentanglement losses should also be monitored during training.
+Record training and validation classification losses separately. Monitor the
+modality disentanglement losses during training.
 
 ### 12.2 Validation
 
-- Evaluate the validation partition after each epoch. It is drawn exclusively
-  from `S_train Ã— V_train`.
-- Do not build a nested validation A/B/C split; A/B/C are final evaluation
-  partitions only and are evaluated once after training.
+- Evaluate the subject-disjoint validation partition after each epoch.
 - Track at least accuracy, balanced accuracy, macro-precision, macro-recall and macro-F1.
 - Use a configurable primary validation metric to select the best checkpoint.
 - Initially, use validation macro-F1 as the primary selection criterion.
-- Never use final test partitions for checkpoint selection or early stopping.
 
 ### 12.3 Early stopping and checkpoints
 
@@ -332,13 +288,13 @@ Save all experiment artifacts inside a dedicated, configurable `out_dir`.
 At minimum, save:
 - Training and validation loss history.
 - Individual loss-component histories.
-- Validation metrics at each epoch, and final A/B/C metrics.
+- Validation metrics at each epoch and final held-out-subject metrics.
 - Loss curves and validation metric curves.
-- Validation subject/video pairs.
+- Selected training and validation participants, including gender strata.
 - Best model checkpoint.
 - Experiment configuration and hyperparameters.
 - Normalization statistics.
-- Random seeds and subject/video split information.
+- Random seed and subject split information.
 
 Use a structured format such as CSV or JSON for numerical histories, alongside plots for visual inspection.
 

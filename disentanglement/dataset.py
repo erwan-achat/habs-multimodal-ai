@@ -18,21 +18,16 @@ class EmotionWindowDataset(Dataset):
         partition_subjects: set[str],
         partition_videos: set[str],
         label_to_id: dict[str, int],
-        subject_to_id: dict[str, int],
         normalization: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
         config: PreprocessingConfig | None = None,
-        max_trials: int = 0,
     ):
         self.config = config or PreprocessingConfig()
         self.trials = trial_index[
             trial_index["participant_id"].isin(partition_subjects)
-            & trial_index["video"].isin(partition_videos)
+            & trial_index["video"].astype(str).isin(partition_videos)
         ].copy()
-        if max_trials > 0:
-            self.trials = self.trials.head(max_trials)
 
         self.label_to_id = label_to_id
-        self.subject_to_id = subject_to_id
         self.normalization = normalization or {}
         self.items: list[dict] = []
         for trial in self.trials.itertuples(index=False):
@@ -51,7 +46,6 @@ class EmotionWindowDataset(Dataset):
                     "window_start_s": float(start_s),
                     "window_stop_s": float(stop_s),
                     "label": label_to_id[emotion],
-                    "subject": subject_to_id.get(str(trial.participant_id), 0),
                 })
         self.cache: OrderedDict[tuple[Path, float, float], dict[str, np.ndarray]] = OrderedDict()
 
@@ -105,7 +99,6 @@ class EmotionWindowDataset(Dataset):
         return {
             **tensors,
             "label": torch.tensor(item["label"], dtype=torch.long),
-            "subject": torch.tensor(item["subject"], dtype=torch.long),
         }
 
 
@@ -113,84 +106,27 @@ class RecordingGroupedSampler(Sampler[int]):
     def __init__(self, items: list[dict], seed: int = 42):
         self.items = items
         self.seed = seed
-        groups: dict[str, list[int]] = OrderedDict()
-        for index, item in enumerate(items):
-            key = str(item["bdf_path"])
-            groups.setdefault(key, []).append(index)
-        self.groups = list(groups.values())
-
-    def __iter__(self):
-        rng = random.Random(self.seed)
-        groups = [list(group) for group in self.groups]
-        rng.shuffle(groups)
-        order = []
-        for group in groups:
-            rng.shuffle(group)
-            order.extend(group)
-        return iter(order)
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-
-class EpochTrialSubsetSampler(Sampler[int]):
-    def __init__(
-        self,
-        items: list[dict],
-        trials_per_epoch: int = 512,
-        trial_fraction_per_epoch: float = 0.0,
-        seed: int = 42,
-    ):
-        self.items = items
-        self.trials_per_epoch = trials_per_epoch
-        self.trial_fraction_per_epoch = trial_fraction_per_epoch
-        self.seed = seed
         self.epoch = 0
-
-        trial_groups: dict[tuple[str, float, float], list[int]] = OrderedDict()
+        recordings: dict[str, dict[tuple[float, float], list[int]]] = OrderedDict()
         for index, item in enumerate(items):
-            trial_key = (
-                str(item["bdf_path"]),
+            recording = str(item["bdf_path"])
+            trial = (
                 float(item["trial_start_s"]),
                 float(item["trial_duration_s"]),
             )
-            trial_groups.setdefault(trial_key, []).append(index)
-        self.trial_groups = list(trial_groups.values())
+            recordings.setdefault(recording, {}).setdefault(trial, []).append(index)
+        self.recordings = recordings
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
 
-    def _selected_groups(self) -> list[list[int]]:
-        trial_count = len(self.trial_groups)
-        if trial_count == 0:
-            return []
-        if self.trials_per_epoch > 0:
-            selected_count = min(trial_count, self.trials_per_epoch)
-        elif self.trial_fraction_per_epoch > 0.0:
-            selected_count = max(
-                1,
-                min(trial_count, round(trial_count * self.trial_fraction_per_epoch)),
-            )
-        else:
-            selected_count = trial_count
-
-        rng = random.Random(self.seed + self.epoch)
-        trial_groups = [list(group) for group in self.trial_groups]
-        rng.shuffle(trial_groups)
-        return trial_groups[:selected_count]
-
     def __iter__(self):
         rng = random.Random(self.seed + self.epoch)
-        selected = self._selected_groups()
-        recording_groups: dict[str, list[list[int]]] = OrderedDict()
-        for group in selected:
-            bdf_path = str(self.items[group[0]]["bdf_path"])
-            recording_groups.setdefault(bdf_path, []).append(group)
-
-        recordings = list(recording_groups.values())
+        recordings = list(self.recordings.values())
         rng.shuffle(recordings)
-        order: list[int] = []
-        for trial_groups in recordings:
+        order = []
+        for trials in recordings:
+            trial_groups = list(trials.values())
             rng.shuffle(trial_groups)
             for group in trial_groups:
                 rng.shuffle(group)
@@ -198,4 +134,4 @@ class EpochTrialSubsetSampler(Sampler[int]):
         return iter(order)
 
     def __len__(self) -> int:
-        return sum(len(group) for group in self._selected_groups())
+        return len(self.items)
