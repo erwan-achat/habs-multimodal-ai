@@ -20,7 +20,7 @@ class PreprocessingConfig:
 class TrainingConfig:
     labels_filename: str = "labels_train.csv"
     batch_size: int = 32
-    epochs: int = 10
+    epochs: int = 50
     subject_count: int = 20
     video_train_fraction: float = 0.8
     learning_rate: float = 1e-3
