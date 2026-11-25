@@ -65,6 +65,7 @@ class MultimodalDisentanglement(nn.Module):
         eeg_channels: int = 62,
         feature_dim: int = 128,
         modalities: tuple[str, ...] = MODALITIES,
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.modalities = tuple(modalities)
@@ -89,12 +90,18 @@ class MultimodalDisentanglement(nn.Module):
         tokens = feature_dim
         self.token_type = nn.Parameter(torch.zeros(1, 2 * len(self.modalities), tokens))
         self.fusion = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=tokens, nhead=1, batch_first=True),
+            nn.TransformerEncoderLayer(
+                d_model=tokens,
+                nhead=4,
+                dropout=dropout,
+                batch_first=True,
+            ),
             num_layers=1,
         )
         self.classifier = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(feature_dim, num_classes),
         )
 

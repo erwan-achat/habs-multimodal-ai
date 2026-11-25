@@ -78,6 +78,7 @@ def build_trial_index(
     root = _preprocessed_root(data_dir)
     rows: list[dict] = []
     recording_bounds: dict[Path, tuple[float, list[tuple[str, float]]]] = {}
+    metadata_cache: dict[Path, dict] = {}
 
     def get_recording_bounds(
         bdf_path: Path,
@@ -114,7 +115,10 @@ def build_trial_index(
         if not metadata_path.is_file():
             continue
 
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata = metadata_cache.get(metadata_path)
+        if metadata is None:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata_cache[metadata_path] = metadata
         segment = metadata.get("dataset_export", {}).get("segments", {}).get("emotion-video", {})
         origin = segment.get("metadata_time_origin_s")
         if origin is None:

@@ -41,7 +41,7 @@ def test_full_model_forward_and_backward() -> None:
     loss.backward()
 
     assert components["logits"].shape == (2, 12)
-    assert model.fusion.layers[0].self_attn.num_heads == 1
+    assert model.fusion.layers[0].self_attn.num_heads == 4
     assert len(components["invariant"]) == 4
     assert len(components["specific"]) == 4
     assert "private" not in components

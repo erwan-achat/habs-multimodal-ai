@@ -35,9 +35,16 @@ def total_loss(
     components: dict,
     targets: torch.Tensor,
     weights: dict[str, float],
+    class_weights: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     logits = components["logits"]
-    task = F.cross_entropy(logits, targets)
+    task = F.cross_entropy(
+        logits,
+        targets,
+        weight=class_weights,
+        label_smoothing=label_smoothing,
+    )
 
     invariant = components["invariant"]
     specific = components["specific"]

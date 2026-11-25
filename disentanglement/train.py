@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import (
     accuracy_score,
-    balanced_accuracy_score,
     precision_recall_fscore_support,
+    recall_score,
 )
 from torch.utils.data import DataLoader
 
@@ -24,7 +24,15 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def train_epoch(model, loader: DataLoader, optimizer, device, weights: dict[str, float]) -> dict[str, float]:
+def train_epoch(
+    model,
+    loader: DataLoader,
+    optimizer,
+    device,
+    weights: dict[str, float],
+    class_weights: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
+) -> dict[str, float]:
     model.train()
     history: dict[str, list[float]] = {}
     for batch in loader:
@@ -33,7 +41,13 @@ def train_epoch(model, loader: DataLoader, optimizer, device, weights: dict[str,
 
         optimizer.zero_grad(set_to_none=True)
         components = model(inputs, return_components=True)
-        loss, values = total_loss(components, targets, weights)
+        loss, values = total_loss(
+            components,
+            targets,
+            weights,
+            class_weights=class_weights,
+            label_smoothing=label_smoothing,
+        )
         loss.backward()
         optimizer.step()
 
@@ -43,11 +57,33 @@ def train_epoch(model, loader: DataLoader, optimizer, device, weights: dict[str,
 
 
 @torch.no_grad()
+def collect_predictions(
+    model,
+    loader: DataLoader,
+    device,
+) -> tuple[list[int], list[int], list[list[float]]]:
+    model.eval()
+    predictions: list[int] = []
+    labels: list[int] = []
+    probabilities: list[list[float]] = []
+    for batch in loader:
+        inputs = {name: batch[name].to(device) for name in model.modalities}
+        targets = batch["label"].to(device)
+        logits = model(inputs)
+        probabilities.extend(F.softmax(logits, dim=-1).cpu().tolist())
+        predictions.extend(logits.argmax(dim=-1).cpu().tolist())
+        labels.extend(targets.cpu().tolist())
+    return labels, predictions, probabilities
+
+
+@torch.no_grad()
 def evaluate(
     model,
     loader: DataLoader,
     device,
     num_classes: int,
+    class_weights: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
 ) -> dict[str, float]:
     model.eval()
     predictions: list[int] = []
@@ -57,7 +93,14 @@ def evaluate(
         inputs = {name: batch[name].to(device) for name in model.modalities}
         targets = batch["label"].to(device)
         logits = model(inputs)
-        loss_values.append(F.cross_entropy(logits, targets).item())
+        loss_values.append(
+            F.cross_entropy(
+                logits,
+                targets,
+                weight=class_weights,
+                label_smoothing=label_smoothing,
+            ).item()
+        )
         predictions.extend(logits.argmax(dim=-1).cpu().tolist())
         labels.extend(targets.cpu().tolist())
 
@@ -71,18 +114,25 @@ def evaluate(
             "macro_f1": 0.0,
         }
 
-    class_ids = list(range(num_classes))
+    present_classes = sorted(set(labels) | set(predictions))
+    present_labels = sorted(set(labels))
     precision, recall, f1, _ = precision_recall_fscore_support(
         labels,
         predictions,
-        labels=class_ids,
+        labels=present_classes,
         average="macro",
         zero_division=0,
     )
     return {
         "loss": float(np.mean(loss_values)) if loss_values else 0.0,
         "accuracy": accuracy_score(labels, predictions),
-        "balanced_accuracy": balanced_accuracy_score(labels, predictions),
+        "balanced_accuracy": float(recall_score(
+            labels,
+            predictions,
+            labels=present_labels,
+            average="macro",
+            zero_division=0,
+        )),
         "macro_precision": float(precision),
         "macro_recall": float(recall),
         "macro_f1": float(f1),

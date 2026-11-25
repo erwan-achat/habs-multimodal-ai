@@ -5,6 +5,57 @@ from pathlib import Path
 import pandas as pd
 
 
+def gender_by_subject(demographics: pd.DataFrame) -> dict[str, str]:
+    if not {"participant_id", "gender"}.issubset(demographics.columns):
+        raise ValueError("Demographics require participant_id and gender columns")
+    rows = demographics[["participant_id", "gender"]].dropna().copy()
+    rows["participant_id"] = rows["participant_id"].astype(str)
+    rows["gender"] = rows["gender"].astype(str).str.strip().str.lower()
+    result: dict[str, str] = {}
+    for participant, group in rows.groupby("participant_id"):
+        genders = set(group["gender"])
+        if len(genders) == 1 and next(iter(genders)) in {"female", "male"}:
+            result[participant] = next(iter(genders))
+    return result
+
+
+def select_cohort_candidates(
+    demographics: pd.DataFrame,
+    preprocessed_root: Path,
+    pool_size: int,
+    seed: int = 42,
+    require_gender_balance: bool = True,
+) -> set[str]:
+    genders = gender_by_subject(demographics)
+    root = Path(preprocessed_root)
+    available_by_gender = {
+        gender: sorted(
+            participant
+            for participant, value in genders.items()
+            if value == gender and (root / participant).is_dir()
+        )
+        for gender in ("female", "male")
+    }
+    rng = random.Random(seed)
+    if require_gender_balance:
+        per_gender = max(1, pool_size // 2)
+        for gender, subjects in available_by_gender.items():
+            if len(subjects) < per_gender:
+                raise ValueError(
+                    f"Need {per_gender} candidate subjects of gender {gender}; "
+                    f"found {len(subjects)} under {root}"
+                )
+        selected: set[str] = set()
+        for subjects in available_by_gender.values():
+            selected.update(rng.sample(subjects, per_gender))
+        return selected
+
+    available = sorted(set().union(*available_by_gender.values()))
+    if not available:
+        raise ValueError(f"No participants with gender found under {root}")
+    return set(rng.sample(available, min(pool_size, len(available))))
+
+
 def build_subject_partitions(
     trial_index: pd.DataFrame,
     demographics: pd.DataFrame,
@@ -12,56 +63,56 @@ def build_subject_partitions(
     video_train_fraction: float = 0.8,
     validation_fraction: float = 0.2,
     seed: int = 42,
+    require_gender_balance: bool = True,
 ) -> dict[str, pd.DataFrame | set[str] | dict[str, str]]:
-    if subject_count <= 0 or subject_count % 2:
+    if subject_count <= 0 or (require_gender_balance and subject_count % 2):
         raise ValueError("subject_count must be a positive even number")
     if not 0.0 < validation_fraction < 1.0:
         raise ValueError("validation_fraction must be between 0 and 1")
     if not 0.0 < video_train_fraction < 1.0:
         raise ValueError("video_train_fraction must be between 0 and 1")
-    if not {"participant_id", "gender"}.issubset(demographics.columns):
-        raise ValueError("Demographics require participant_id and gender columns")
 
-    demographic_rows = demographics[["participant_id", "gender"]].dropna().copy()
-    demographic_rows["participant_id"] = demographic_rows["participant_id"].astype(str)
-    demographic_rows["gender"] = demographic_rows["gender"].astype(str).str.strip().str.lower()
-    gender_by_subject = {}
-    for participant, group in demographic_rows.groupby("participant_id"):
-        genders = set(group["gender"])
-        if len(genders) == 1 and next(iter(genders)) in {"female", "male"}:
-            gender_by_subject[participant] = next(iter(genders))
-
+    genders = gender_by_subject(demographics)
     eligible_subjects = set(trial_index["participant_id"].astype(str))
     available_by_gender = {
         gender: sorted(
-            participant for participant, value in gender_by_subject.items()
+            participant for participant, value in genders.items()
             if value == gender and participant in eligible_subjects
         )
         for gender in ("female", "male")
     }
-    per_gender = subject_count // 2
-    if any(len(subjects) < per_gender for subjects in available_by_gender.values()):
-        raise ValueError(
-            f"Need {per_gender} valid subjects of each gender; "
-            f"found female={len(available_by_gender['female'])}, "
-            f"male={len(available_by_gender['male'])}"
-        )
-
     rng = random.Random(seed)
-    selected_by_gender = {
-        gender: rng.sample(subjects, per_gender)
-        for gender, subjects in available_by_gender.items()
-    }
-    validation_count = round(per_gender * validation_fraction)
-    if validation_count < 1 or validation_count >= per_gender:
-        raise ValueError("validation_fraction must leave train and validation subjects per gender")
-
-    train_subjects: set[str] = set()
-    validation_subjects: set[str] = set()
-    for subjects in selected_by_gender.values():
-        rng.shuffle(subjects)
-        validation_subjects.update(subjects[:validation_count])
-        train_subjects.update(subjects[validation_count:])
+    if require_gender_balance:
+        per_gender = subject_count // 2
+        if any(len(subjects) < per_gender for subjects in available_by_gender.values()):
+            raise ValueError(
+                f"Need {per_gender} valid subjects of each gender; "
+                f"found female={len(available_by_gender['female'])}, "
+                f"male={len(available_by_gender['male'])}"
+            )
+        validation_per_gender = round(per_gender * validation_fraction)
+        if validation_per_gender < 1 or validation_per_gender >= per_gender:
+            raise ValueError("validation_fraction must leave train and validation subjects per gender")
+        train_subjects: set[str] = set()
+        validation_subjects: set[str] = set()
+        for subjects in available_by_gender.values():
+            selected = rng.sample(subjects, per_gender)
+            rng.shuffle(selected)
+            validation_subjects.update(selected[:validation_per_gender])
+            train_subjects.update(selected[validation_per_gender:])
+    else:
+        available = sorted(set().union(*available_by_gender.values()))
+        if len(available) < subject_count:
+            raise ValueError(
+                f"Need {subject_count} valid subjects; found {len(available)}"
+            )
+        selected = rng.sample(available, subject_count)
+        validation_count = round(len(selected) * validation_fraction)
+        if validation_count < 1 or validation_count >= len(selected):
+            raise ValueError("validation_fraction must leave train and validation subjects")
+        rng.shuffle(selected)
+        validation_subjects = set(selected[:validation_count])
+        train_subjects = set(selected[validation_count:])
 
     participant_ids = trial_index["participant_id"].astype(str)
     cohort_trials = trial_index.loc[
@@ -101,10 +152,10 @@ def build_subject_partitions(
         "train_videos": train_videos,
         "validation_videos": validation_videos,
         "train_genders": {
-            subject: gender_by_subject[subject] for subject in sorted(train_subjects)
+            subject: genders[subject] for subject in sorted(train_subjects)
         },
         "validation_genders": {
-            subject: gender_by_subject[subject] for subject in sorted(validation_subjects)
+            subject: genders[subject] for subject in sorted(validation_subjects)
         },
     }
 

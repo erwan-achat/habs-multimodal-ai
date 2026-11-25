@@ -8,7 +8,10 @@ import pandas as pd
 from disentanglement.data_loading import build_trial_index
 from disentanglement.dataset import RecordingGroupedSampler
 from disentanglement.preprocessing import window_offsets
-from disentanglement.splits import build_subject_partitions
+from disentanglement.splits import (
+    build_subject_partitions,
+    select_cohort_candidates,
+)
 
 
 def _write_record_map(path: Path, n_eeg: int = 62) -> None:
@@ -296,6 +299,61 @@ def test_recording_grouped_sampler_preserves_full_window_coverage() -> None:
 
     assert sorted(order) == [0, 1, 2]
     assert order.index(0) + 1 == order.index(1) or order.index(1) + 1 == order.index(0)
+
+
+def test_select_cohort_candidates_filters_existing_preprocessed_dirs(tmp_path: Path) -> None:
+    demographics = pd.DataFrame({
+        "participant_id": ["P001", "P002", "P003", "P004"],
+        "gender": ["female", "female", "male", "male"],
+    })
+    root = tmp_path / "PREPROCESSED"
+    for participant in ("P001", "P002", "P003"):
+        (root / participant).mkdir(parents=True)
+
+    balanced = select_cohort_candidates(
+        demographics,
+        root,
+        pool_size=2,
+        seed=42,
+        require_gender_balance=True,
+    )
+    assert len(balanced) == 2
+    assert "P003" in balanced
+    assert balanced & {"P001", "P002"}
+
+    unbalanced = select_cohort_candidates(
+        demographics,
+        root,
+        pool_size=4,
+        seed=42,
+        require_gender_balance=False,
+    )
+    assert unbalanced == {"P001", "P002", "P003"}
+
+
+def test_partitions_support_unbalanced_gender_mode() -> None:
+    demographics = pd.DataFrame({
+        "participant_id": [f"P{i:03}" for i in range(6)],
+        "gender": ["female"] * 6,
+    })
+    trial_index = pd.DataFrame({
+        "participant_id": [f"P{i:03}" for i in range(6) for _ in range(10)],
+        "video": [f"V{j:02}" for _ in range(6) for j in range(10)],
+    })
+
+    partitions = build_subject_partitions(
+        trial_index,
+        demographics,
+        subject_count=2,
+        validation_fraction=0.5,
+        seed=42,
+        require_gender_balance=False,
+    )
+
+    assert len(partitions["train_subjects"]) == 1
+    assert len(partitions["validation_subjects"]) == 1
+    assert set(partitions["train_genders"].values()) == {"female"}
+    assert set(partitions["validation_genders"].values()) == {"female"}
 
 
 def test_subject_video_partitions_are_balanced_disjoint_and_reproducible() -> None:
