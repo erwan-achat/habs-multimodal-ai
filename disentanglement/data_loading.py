@@ -1,4 +1,5 @@
 import json
+from collections.abc import Iterable
 from pathlib import Path
 
 import mne
@@ -36,6 +37,7 @@ def build_trial_index(
     data_dir: Path,
     labels_path: Path | str | None = None,
     config: PreprocessingConfig | None = None,
+    participant_ids: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     config = config or PreprocessingConfig()
     data_dir = Path(data_dir)
@@ -69,6 +71,9 @@ def build_trial_index(
         & labels["final_emotion_label"].notna()
         & (labels["final_emotion_label"].astype(str).str.strip() != "")
     ].copy()
+    if participant_ids is not None:
+        allowed = {str(value) for value in participant_ids}
+        labels = labels.loc[labels["participant_id"].astype(str).isin(allowed)].copy()
 
     root = _preprocessed_root(data_dir)
     rows: list[dict] = []
