@@ -8,6 +8,14 @@ name: HABS
 #   habs run --data ./sample --out ./out
 on:
   workflow_dispatch:
+    inputs:
+      experiment:
+        description: Experiment to run on HABS
+        type: choice
+        default: disentanglement
+        options:
+          - disentanglement
+          - habs-v1-transfer
 
 permissions:
   contents: read
@@ -67,10 +75,18 @@ jobs:
 
       - run: pip install --quiet "$HABS_CLIENT"
 
-      # Uploads this commit and waits only for the image. Returns in a minute
-      # or two with the pip log, and hands the job id to the next job.
       - id: submit
-        run: habs submit --sha "${{ github.sha }}" --until built
+        shell: bash
+        env:
+          HABS_EXPERIMENT: ${{ inputs.experiment }}
+        run: |
+          job_source=.
+          if [[ "$HABS_EXPERIMENT" == habs-v1-transfer ]]; then
+            # Outside the checkout, HABS packages this directory as the job root.
+            job_source=$(mktemp -d "$RUNNER_TEMP/habs-v1.XXXXXX")
+            git archive "$GITHUB_SHA:habs-v1-transfer" | tar -xf - -C "$job_source"
+          fi
+          habs submit --source "$job_source" --sha "$GITHUB_SHA" --until built
 
   run:
     name: run on a GPU
